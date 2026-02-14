@@ -29,6 +29,12 @@ from point_policy_rl.env_bridge_rl import (
     observation_to_state,
 )
 from point_policy_rl.td3_agent_rl import ResidualTD3AgentRL, TD3ConfigRL
+from point_policy_rl.train_resfit_residual_td3_rl import (
+    LinearActionNormalizerRL,
+    _build_resfit_qagent,
+    _ensure_resfit_common_utils_compat,
+    _state_to_agent_obs_batched,
+)
 from point_policy_rl.utils_rl import coerce_device, set_seed
 
 
@@ -38,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--resfit-root",
+        type=str,
+        default="/sjw_alinlab2/home/sanghyeok/residual-offpolicy-rl",
+    )
     parser.add_argument("--suite", type=str, default=None, choices=["libero_spatial", "libero_object"])
     parser.add_argument("--task-name", type=str, default=None)
     parser.add_argument("--env-max-episode-len", type=int, default=300)
@@ -47,6 +58,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-render-size", type=int, default=256)
     parser.add_argument("--video-tag", type=str, default="")
     return parser.parse_args()
+
+
+def _resolve_bc_weight(payload: dict) -> str:
+    bc_weight = payload.get("bc_weight")
+    if bc_weight is not None and str(bc_weight).strip() != "":
+        return str(bc_weight)
+    args = payload.get("args", {})
+    if isinstance(args, dict):
+        bc_weight = args.get("bc_weight")
+        if bc_weight is not None and str(bc_weight).strip() != "":
+            return str(bc_weight)
+    raise KeyError("Missing bc_weight in checkpoint payload (expected top-level or args.bc_weight)")
+
+
+def _build_resfit_args_for_eval(payload: dict, cli_resfit_root: str) -> argparse.Namespace:
+    args = payload.get("args", {})
+    if not isinstance(args, dict):
+        args = {}
+
+    def _get(name: str, default):
+        value = args.get(name, default)
+        if value is None:
+            return default
+        return value
+
+    return argparse.Namespace(
+        resfit_root=str(_get("resfit_root", cli_resfit_root)),
+        actor_lr=float(_get("actor_lr", 1e-4)),
+        critic_lr=float(_get("critic_lr", 1e-4)),
+        critic_target_tau=float(_get("critic_target_tau", 0.005)),
+        freeze_encoder=bool(_get("freeze_encoder", False)),
+        critic_hidden_dim=int(_get("critic_hidden_dim", 1024)),
+        num_q_heads=int(_get("num_q_heads", 10)),
+        policy_gradient_type=str(_get("policy_gradient_type", "ensemble_mean")),
+        actor_hidden_dim=int(_get("actor_hidden_dim", 1024)),
+        residual_action_scale=float(_get("residual_action_scale", 1.0)),
+        dummy_image_size=int(_get("dummy_image_size", 84)),
+        camera_key=str(_get("camera_key", "observation.images.agentview")),
+    )
 
 
 def _slugify(text: str) -> str:
@@ -143,9 +193,11 @@ def main() -> None:
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
 
     payload = torch.load(ckpt_path, map_location=device)
-    bc_weight = payload.get("bc_weight")
-    if bc_weight is None:
-        raise KeyError("Missing bc_weight in checkpoint payload")
+    ckpt_format = "resfit_agent" if "agent" in payload else "td3_legacy"
+    if ckpt_format == "td3_legacy" and "td3" not in payload:
+        raise KeyError("Unsupported checkpoint format: expected 'td3' or 'agent' key")
+
+    bc_weight = _resolve_bc_weight(payload)
 
     repo_root = Path(__file__).resolve().parents[1]
 
@@ -155,8 +207,12 @@ def main() -> None:
         device=device,
     )
 
-    suite_override = args.suite or payload.get("suite")
-    task_override = args.task_name or payload.get("task_name")
+    payload_args = payload.get("args", {})
+    if not isinstance(payload_args, dict):
+        payload_args = {}
+
+    suite_override = args.suite or payload.get("suite") or payload_args.get("suite")
+    task_override = args.task_name or payload.get("task_name") or payload_args.get("task_name")
 
     env, _, pixel_key, low_default, high_default, _ = build_single_env_from_bc_config(
         cfg=base.cfg,
@@ -181,7 +237,7 @@ def main() -> None:
     base_dict0 = base.act(obs0, 0, 0)
     base_action0 = np.asarray(env.point2action(base_dict0), dtype=np.float32).reshape(7)
 
-    include_eef_pos = bool(payload.get("include_eef_pos", False))
+    include_eef_pos = bool(payload.get("include_eef_pos", payload_args.get("include_eef_pos", False)))
     state0 = observation_to_state(
         obs=obs0,
         pixel_key=pixel_key,
@@ -189,33 +245,60 @@ def main() -> None:
         include_eef_pos=include_eef_pos,
     )
 
-    td3_payload = payload["td3"]
-    td3_cfg_saved = td3_payload.get("cfg", {})
+    td3 = None
+    q_agent = None
+    resfit_utils = None
+    action_normalizer = None
 
-    residual_scale_src = payload.get("residual_scale")
-    if residual_scale_src is None:
-        residual_scale_src = td3_payload.get("action_scale")
-    residual_scale = np.asarray(residual_scale_src, dtype=np.float32).reshape(7)
+    if ckpt_format == "td3_legacy":
+        td3_payload = payload["td3"]
+        td3_cfg_saved = td3_payload.get("cfg", {})
 
-    td3_cfg = TD3ConfigRL(
-        obs_dim=int(payload.get("obs_dim", state0.shape[0])),
-        action_dim=int(payload.get("action_dim", 7)),
-        device=device,
-        actor_hidden_dim=int(td3_cfg_saved.get("actor_hidden_dim", 256)),
-        critic_hidden_dim=int(td3_cfg_saved.get("critic_hidden_dim", 256)),
-        actor_lr=float(td3_cfg_saved.get("actor_lr", 3e-4)),
-        critic_lr=float(td3_cfg_saved.get("critic_lr", 3e-4)),
-        gamma=float(td3_cfg_saved.get("gamma", 0.99)),
-        tau=float(td3_cfg_saved.get("tau", 0.005)),
-        policy_noise=float(td3_cfg_saved.get("policy_noise", 0.2)),
-        noise_clip=float(td3_cfg_saved.get("noise_clip", 0.5)),
-        actor_update_freq=int(td3_cfg_saved.get("actor_update_freq", 2)),
-    )
-    td3 = ResidualTD3AgentRL(cfg=td3_cfg, action_scale=residual_scale)
-    td3.load_state_dict(td3_payload)
+        residual_scale_src = payload.get("residual_scale")
+        if residual_scale_src is None:
+            residual_scale_src = td3_payload.get("action_scale")
+        residual_scale = np.asarray(residual_scale_src, dtype=np.float32).reshape(7)
 
-    low = np.asarray(payload.get("low", low_default.tolist()), dtype=np.float32).reshape(7)
-    high = np.asarray(payload.get("high", high_default.tolist()), dtype=np.float32).reshape(7)
+        td3_cfg = TD3ConfigRL(
+            obs_dim=int(payload.get("obs_dim", state0.shape[0])),
+            action_dim=int(payload.get("action_dim", 7)),
+            device=device,
+            actor_hidden_dim=int(td3_cfg_saved.get("actor_hidden_dim", 256)),
+            critic_hidden_dim=int(td3_cfg_saved.get("critic_hidden_dim", 256)),
+            actor_lr=float(td3_cfg_saved.get("actor_lr", 3e-4)),
+            critic_lr=float(td3_cfg_saved.get("critic_lr", 3e-4)),
+            gamma=float(td3_cfg_saved.get("gamma", 0.99)),
+            tau=float(td3_cfg_saved.get("tau", 0.005)),
+            policy_noise=float(td3_cfg_saved.get("policy_noise", 0.2)),
+            noise_clip=float(td3_cfg_saved.get("noise_clip", 0.5)),
+            actor_update_freq=int(td3_cfg_saved.get("actor_update_freq", 2)),
+        )
+        td3 = ResidualTD3AgentRL(cfg=td3_cfg, action_scale=residual_scale)
+        td3.load_state_dict(td3_payload)
+    else:
+        q_args = _build_resfit_args_for_eval(payload=payload, cli_resfit_root=args.resfit_root)
+        q_agent = _build_resfit_qagent(
+            args=q_args,
+            device=device,
+            action_dim=7,
+            prop_dim=int(state0.shape[0] - 7),
+        )
+        q_agent.load_state_dict(payload["agent"])
+        resfit_utils = _ensure_resfit_common_utils_compat(Path(q_args.resfit_root).expanduser().resolve())
+        normalizer_payload = payload.get("action_normalizer", {})
+        if not isinstance(normalizer_payload, dict):
+            normalizer_payload = {}
+        action_normalizer = LinearActionNormalizerRL(
+            low=np.asarray(normalizer_payload.get("low", low_default.tolist()), dtype=np.float32).reshape(7),
+            high=np.asarray(normalizer_payload.get("high", high_default.tolist()), dtype=np.float32).reshape(7),
+        )
+
+    if action_normalizer is not None:
+        low = np.asarray(action_normalizer.low, dtype=np.float32).reshape(7)
+        high = np.asarray(action_normalizer.high, dtype=np.float32).reshape(7)
+    else:
+        low = np.asarray(payload.get("low", low_default.tolist()), dtype=np.float32).reshape(7)
+        high = np.asarray(payload.get("high", high_default.tolist()), dtype=np.float32).reshape(7)
 
     episode_returns = []
     successes = []
@@ -255,14 +338,40 @@ def main() -> None:
                 base_action_7d=base_action,
                 include_eef_pos=include_eef_pos,
             )
-            residual_action = td3.select_action(state, exploration_std=0.0, deterministic=True)
-            env_action = clip_action(base_action + residual_action, low=low, high=high)
+            if td3 is not None:
+                residual_action = td3.select_action(state, exploration_std=0.0, deterministic=True)
+                env_action = clip_action(base_action + residual_action, low=low, high=high)
+            else:
+                assert q_agent is not None
+                assert resfit_utils is not None
+                assert action_normalizer is not None
+                agent_obs = _state_to_agent_obs_batched(
+                    state_vec=state,
+                    action_normalizer=action_normalizer,
+                    camera_key=q_args.camera_key,
+                    dummy_image_size=int(q_args.dummy_image_size),
+                    device=device,
+                )
+                with resfit_utils.eval_mode(q_agent):
+                    residual_norm = (
+                        q_agent.act(agent_obs, eval_mode=True, stddev=0.0, cpu=True)
+                        .squeeze(0)
+                        .numpy()
+                        .astype(np.float32)
+                    )
+                base_norm = action_normalizer.normalize(base_action)
+                combined_norm = np.clip(base_norm + residual_norm, -1.0, 1.0).astype(np.float32)
+                env_action = clip_action(action_normalizer.denormalize(combined_norm), low=low, high=high)
 
             time_step = env.step(env_action)
             obs = time_step.observation
-            ep_ret += float(time_step.reward)
             done = bool(time_step.last())
-            if bool(obs.get("goal_achieved", False)):
+            goal_achieved = bool(obs.get("goal_achieved", False))
+            if td3 is not None:
+                ep_ret += float(time_step.reward)
+            else:
+                ep_ret += 1.0 if (done and goal_achieved) else 0.0
+            if goal_achieved:
                 success = 1
             step_in_ep += 1
             if video_enabled:
@@ -292,6 +401,7 @@ def main() -> None:
         "mean_return": float(np.mean(episode_returns)) if episode_returns else 0.0,
         "mean_success": float(np.mean(successes)) if successes else 0.0,
         "checkpoint": str(ckpt_path),
+        "checkpoint_format": ckpt_format,
         "suite": suite_override,
         "task": task_override,
     }

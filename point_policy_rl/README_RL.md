@@ -83,7 +83,9 @@ python point_policy_rl/eval_residual_td3_rl.py \
 
 - Existing BC scripts remain untouched (`point_policy/train.py`, `point_policy/eval_point_track.py`).
 - Offline transitions are built from Point-Policy demo pkl files (`observations`) with
-  residual target fixed to zero (`action=0`) and terminal reward shaping.
+  terminal reward shaping.
+- `train_residual_td3_rl.py` uses offline transition default `transition_action_mode="residual_zero"` (`action=0`).
+- `train_resfit_residual_td3_rl.py` uses offline transition `transition_action_mode="combined_base"` (full action path).
 - `--offline-base-action-mode`:
   - `demo_delta`: demo frame difference as base action (GT-as-base style)
   - `bc_track_delta`: frozen BC prediction delta as base action approximation
