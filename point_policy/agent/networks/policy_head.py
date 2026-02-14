@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import utils
-from agent.networks.utils.diffusion_policy import DiffusionPolicy
 from agent.networks.mlp import MLP
 
 ######################################### Deterministic Head #########################################
@@ -100,6 +99,8 @@ class DiffusionHead(nn.Module):
         loss_coef=100.0,
     ):
         super().__init__()
+        # Import lazily so deterministic runs do not require diffusion deps.
+        from agent.networks.utils.diffusion_policy import DiffusionPolicy
 
         self.net = DiffusionPolicy(
             obs_dim=input_size,
