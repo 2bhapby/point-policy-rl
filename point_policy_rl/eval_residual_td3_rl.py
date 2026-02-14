@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import imageio.v2 as imageio
+
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
+
+# Allow `python point_policy_rl/eval_residual_td3_rl.py` execution.
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from point_policy_rl.base_policy_adapter_rl import FrozenPointPolicyBaseRL
+from point_policy_rl.env_bridge_rl import (
+    build_single_env_from_bc_config,
+    clip_action,
+    observation_to_state,
+)
+from point_policy_rl.td3_agent_rl import ResidualTD3AgentRL, TD3ConfigRL
+from point_policy_rl.utils_rl import coerce_device, set_seed
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate residual TD3 checkpoint in _rl namespace")
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--suite", type=str, default=None, choices=["libero_spatial", "libero_object"])
+    parser.add_argument("--task-name", type=str, default=None)
+    parser.add_argument("--env-max-episode-len", type=int, default=300)
+    parser.add_argument("--save-video", action="store_true")
+    parser.add_argument("--video-dir", type=str, default=None)
+    parser.add_argument("--video-fps", type=int, default=20)
+    parser.add_argument("--video-render-size", type=int, default=256)
+    parser.add_argument("--video-tag", type=str, default="")
+    return parser.parse_args()
+
+
+def _slugify(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("_")
+
+
+def _normalize_frame(frame: np.ndarray, render_size: int) -> np.ndarray:
+    out = np.asarray(frame)
+    if out.ndim == 2:
+        out = np.repeat(out[..., None], 3, axis=2)
+    if out.ndim != 3:
+        raise ValueError(f"Unsupported frame ndim={out.ndim}")
+    if out.shape[2] == 1:
+        out = np.repeat(out, 3, axis=2)
+    elif out.shape[2] > 3:
+        out = out[:, :, :3]
+    if out.dtype != np.uint8:
+        out = np.clip(out, 0, 255).astype(np.uint8)
+
+    if (
+        int(render_size) > 0
+        and (out.shape[0] != int(render_size) or out.shape[1] != int(render_size))
+        and cv2 is not None
+    ):
+        out = cv2.resize(
+            out,
+            dsize=(int(render_size), int(render_size)),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    return out
+
+
+def _capture_frame(env, render_size: int) -> np.ndarray:
+    if hasattr(env, "physics"):
+        frame = env.physics.render(height=int(render_size), width=int(render_size), camera_id=0)
+    else:
+        try:
+            frame = env.render(mode="rgb_array", width=int(render_size), height=int(render_size))
+        except TypeError:
+            frame = env.render()
+    return _normalize_frame(frame, render_size=render_size)
+
+
+def _resolve_video_dir(ckpt_path: Path, cli_video_dir: str | None) -> Path:
+    if cli_video_dir is not None and str(cli_video_dir).strip() != "":
+        out_dir = Path(cli_video_dir).expanduser().resolve()
+    else:
+        run_dir = ckpt_path.parent.parent if ckpt_path.parent.name == "snapshot" else ckpt_path.parent
+        out_dir = (run_dir / "eval_videos_rl").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _build_video_filename(
+    ep_idx: int,
+    suite_name: str | None,
+    task_name: str | None,
+    success: int,
+    video_tag: str,
+) -> str:
+    parts: list[str] = []
+    tag = _slugify(video_tag)
+    if tag:
+        parts.append(tag)
+    parts.append(f"ep{int(ep_idx):03d}")
+    parts.append(_slugify(suite_name or "suite"))
+    parts.append(_slugify(task_name or "task")[:80] or "task")
+    parts.append("success" if int(success) > 0 else "fail")
+    return "__".join(parts) + ".mp4"
+
+
+def _dedup_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    idx = 2
+    while True:
+        candidate = path.with_name(f"{stem}_v{idx}{suffix}")
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def main() -> None:
+    args = parse_args()
+    device = coerce_device(args.device)
+    set_seed(args.seed)
+
+    import torch
+
+    ckpt_path = Path(args.ckpt).resolve()
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+
+    payload = torch.load(ckpt_path, map_location=device)
+    bc_weight = payload.get("bc_weight")
+    if bc_weight is None:
+        raise KeyError("Missing bc_weight in checkpoint payload")
+
+    repo_root = Path(__file__).resolve().parents[1]
+
+    base = FrozenPointPolicyBaseRL(
+        repo_root=repo_root,
+        bc_weight=Path(bc_weight),
+        device=device,
+    )
+
+    suite_override = args.suite or payload.get("suite")
+    task_override = args.task_name or payload.get("task_name")
+
+    env, _, pixel_key, low_default, high_default, _ = build_single_env_from_bc_config(
+        cfg=base.cfg,
+        repo_root=repo_root,
+        suite_override=suite_override,
+        task_override=task_override,
+        seed=args.seed,
+        eval_mode=True,
+        max_episode_len=args.env_max_episode_len,
+    )
+
+    base.build(
+        obs_spec=env.observation_spec(),
+        action_spec=env.action_spec(),
+        max_episode_len=args.env_max_episode_len,
+    )
+
+    # Bootstrap state dim from env+base observation.
+    t0 = env.reset()
+    obs0 = t0.observation
+    base.reset_episode()
+    base_dict0 = base.act(obs0, 0, 0)
+    base_action0 = np.asarray(env.point2action(base_dict0), dtype=np.float32).reshape(7)
+
+    include_eef_pos = bool(payload.get("include_eef_pos", False))
+    state0 = observation_to_state(
+        obs=obs0,
+        pixel_key=pixel_key,
+        base_action_7d=base_action0,
+        include_eef_pos=include_eef_pos,
+    )
+
+    td3_payload = payload["td3"]
+    td3_cfg_saved = td3_payload.get("cfg", {})
+
+    residual_scale_src = payload.get("residual_scale")
+    if residual_scale_src is None:
+        residual_scale_src = td3_payload.get("action_scale")
+    residual_scale = np.asarray(residual_scale_src, dtype=np.float32).reshape(7)
+
+    td3_cfg = TD3ConfigRL(
+        obs_dim=int(payload.get("obs_dim", state0.shape[0])),
+        action_dim=int(payload.get("action_dim", 7)),
+        device=device,
+        actor_hidden_dim=int(td3_cfg_saved.get("actor_hidden_dim", 256)),
+        critic_hidden_dim=int(td3_cfg_saved.get("critic_hidden_dim", 256)),
+        actor_lr=float(td3_cfg_saved.get("actor_lr", 3e-4)),
+        critic_lr=float(td3_cfg_saved.get("critic_lr", 3e-4)),
+        gamma=float(td3_cfg_saved.get("gamma", 0.99)),
+        tau=float(td3_cfg_saved.get("tau", 0.005)),
+        policy_noise=float(td3_cfg_saved.get("policy_noise", 0.2)),
+        noise_clip=float(td3_cfg_saved.get("noise_clip", 0.5)),
+        actor_update_freq=int(td3_cfg_saved.get("actor_update_freq", 2)),
+    )
+    td3 = ResidualTD3AgentRL(cfg=td3_cfg, action_scale=residual_scale)
+    td3.load_state_dict(td3_payload)
+
+    low = np.asarray(payload.get("low", low_default.tolist()), dtype=np.float32).reshape(7)
+    high = np.asarray(payload.get("high", high_default.tolist()), dtype=np.float32).reshape(7)
+
+    episode_returns = []
+    successes = []
+    saved_videos: list[str] = []
+    video_dir: Path | None = None
+    video_enabled = bool(args.save_video)
+    if video_enabled:
+        video_dir = _resolve_video_dir(ckpt_path=ckpt_path, cli_video_dir=args.video_dir)
+        print(
+            f"[video] enabled dir={video_dir} fps={int(args.video_fps)} "
+            f"render_size={int(args.video_render_size)}"
+        )
+
+    for ep_idx in range(args.episodes):
+        time_step = env.reset()
+        obs = time_step.observation
+        base.reset_episode()
+        ep_ret = 0.0
+        done = False
+        step_in_ep = 0
+        success = 0
+        frames: list[np.ndarray] = []
+
+        if video_enabled:
+            try:
+                frames.append(_capture_frame(env=env, render_size=int(args.video_render_size)))
+            except Exception as exc:
+                print(f"[video] capture disabled after init failure: {exc}")
+                video_enabled = False
+
+        while not done:
+            base_action_dict = base.act(obs, step_in_ep, step_in_ep)
+            base_action = np.asarray(env.point2action(base_action_dict), dtype=np.float32).reshape(7)
+            state = observation_to_state(
+                obs=obs,
+                pixel_key=pixel_key,
+                base_action_7d=base_action,
+                include_eef_pos=include_eef_pos,
+            )
+            residual_action = td3.select_action(state, exploration_std=0.0, deterministic=True)
+            env_action = clip_action(base_action + residual_action, low=low, high=high)
+
+            time_step = env.step(env_action)
+            obs = time_step.observation
+            ep_ret += float(time_step.reward)
+            done = bool(time_step.last())
+            if bool(obs.get("goal_achieved", False)):
+                success = 1
+            step_in_ep += 1
+            if video_enabled:
+                try:
+                    frames.append(_capture_frame(env=env, render_size=int(args.video_render_size)))
+                except Exception as exc:
+                    print(f"[video] capture disabled while stepping: {exc}")
+                    video_enabled = False
+
+        episode_returns.append(ep_ret)
+        successes.append(success)
+        if video_enabled and video_dir is not None and len(frames) > 0:
+            video_name = _build_video_filename(
+                ep_idx=ep_idx,
+                suite_name=suite_override,
+                task_name=task_override,
+                success=success,
+                video_tag=args.video_tag,
+            )
+            video_path = _dedup_path(video_dir / video_name)
+            imageio.mimsave(str(video_path), frames, fps=max(1, int(args.video_fps)))
+            saved_videos.append(str(video_path))
+            print(f"[video] saved: {video_path}")
+
+    result = {
+        "episodes": args.episodes,
+        "mean_return": float(np.mean(episode_returns)) if episode_returns else 0.0,
+        "mean_success": float(np.mean(successes)) if successes else 0.0,
+        "checkpoint": str(ckpt_path),
+        "suite": suite_override,
+        "task": task_override,
+    }
+    if video_dir is not None:
+        result["video_dir"] = str(video_dir)
+        result["saved_videos"] = saved_videos
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
