@@ -1,5 +1,7 @@
 # LIBERO Spatial Best Run Manual (Train 189680 / Eval 199992)
 
+> Comment tag: 유의미한 성공률
+
 ## 1) Best checkpoint
 - Base BC checkpoint (train run):
   - `/sjw_alinlab2/home/sanghyeok/Point-Policy_codex_libero/point_policy/exp_local/2026.02.10/point_policy_libero_spatial_cmd_sephead_ctx_bce5_201k_v1/debug_189680_cmd_sephead_ctx_bce5_201k_v1/232901_hidden_dim_256/snapshot/200000.pt`
