@@ -253,6 +253,11 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         self._current_raw_obs = None
         self._last_robot_action = np.zeros((7,), dtype=np.float32)
         self._warned_missing_eef_quat = False
+        self._multi_object_geom_mode = bool(
+            self._use_object_points and self._num_object_points != 7
+        )
+        self._multi_object_points_per_object = 5
+        self._multi_object_specs = None
 
         if self._use_robot_points:
             if self._robot_point_indices is None:
@@ -307,10 +312,17 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
             )
             self._gripper_command_fallback_to_tip_distance = False
 
-        if self._use_object_points and self._num_object_points != 7:
-            raise ValueError(
-                f"Expected num_object_points=7 (basket4 + object3), got {self._num_object_points}"
-            )
+        if self._multi_object_geom_mode:
+            if self._num_object_points < self._multi_object_points_per_object:
+                raise ValueError(
+                    "num_object_points must be >=5 in multi-object geom mode, "
+                    f"got {self._num_object_points}"
+                )
+            if self._num_object_points % self._multi_object_points_per_object != 0:
+                raise ValueError(
+                    "num_object_points in multi-object geom mode must be divisible by 5 "
+                    f"(points per object), got {self._num_object_points}"
+                )
 
         self._pixel_to_camera = self._make_pixel_to_camera_map(self._pixel_keys)
 
@@ -662,6 +674,60 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
             raise ValueError(f"No geoms found for body subtree rooted at id={body_id}")
         return geom_ids
 
+    def _select_representative_geom_ids(self, points_world, geom_ids, k):
+        points_world = np.asarray(points_world, dtype=np.float32).reshape(-1, 3)
+        geom_ids = np.asarray(geom_ids, dtype=np.int32).reshape(-1)
+        if points_world.shape[0] != geom_ids.shape[0]:
+            raise ValueError(
+                "points_world and geom_ids must have same length, got "
+                f"{points_world.shape[0]} vs {geom_ids.shape[0]}"
+            )
+        if points_world.shape[0] == 0:
+            raise ValueError("Cannot select representative geoms from empty input")
+
+        if points_world.shape[0] <= int(k):
+            selected = geom_ids.copy()
+            while selected.shape[0] < int(k):
+                selected = np.concatenate([selected, selected[-1:]], axis=0)
+            return selected[: int(k)]
+
+        centroid = points_world.mean(axis=0, keepdims=True)
+        first = int(np.argmax(np.linalg.norm(points_world - centroid, axis=-1)))
+        selected_local = [first]
+        min_dist = np.linalg.norm(points_world - points_world[first : first + 1], axis=-1)
+        for _ in range(1, int(k)):
+            nxt = int(np.argmax(min_dist))
+            selected_local.append(nxt)
+            dist_to_new = np.linalg.norm(
+                points_world - points_world[nxt : nxt + 1], axis=-1
+            )
+            min_dist = np.minimum(min_dist, dist_to_new)
+        return geom_ids[np.asarray(selected_local, dtype=np.int32)]
+
+    def _build_multi_object_specs(self):
+        object_names = list(self._obj_of_interest)
+        if len(object_names) == 0:
+            raise ValueError("obj_of_interest is empty; cannot build multi-object specs")
+
+        max_objects = self._num_object_points // self._multi_object_points_per_object
+        selected_names = object_names[:max_objects]
+        specs = []
+        for object_name in selected_names:
+            body_id = self._resolve_body_id(object_name)
+            geom_ids = self._collect_object_geom_ids(body_id)
+            geom_points = np.asarray(self._env.sim.data.geom_xpos[geom_ids], dtype=np.float32)
+            selected_geom_ids = self._select_representative_geom_ids(
+                geom_points, geom_ids, self._multi_object_points_per_object
+            )
+            specs.append(
+                {
+                    "object_name": object_name,
+                    "body_id": int(body_id),
+                    "selected_geom_ids": np.asarray(selected_geom_ids, dtype=np.int32),
+                }
+            )
+        return specs
+
     def _target_axis_points_from_geoms(self, geom_points_world):
         geom_points = np.asarray(geom_points_world, dtype=np.float32).reshape(-1, 3)
         if geom_points.shape[0] == 0:
@@ -690,6 +756,12 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
     def _ensure_geometry_metadata(self, raw_obs):
         if self._use_robot_points and self._robot_site_ids is None:
             self._resolve_robot_site_ids()
+
+        if self._multi_object_geom_mode:
+            if self._multi_object_specs is None:
+                self._refresh_name_caches()
+                self._multi_object_specs = self._build_multi_object_specs()
+            return
 
         if self._use_object_points and (
             self._target_local_points is None or self._basket_local_corners is None
@@ -740,6 +812,29 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         if not self._use_object_points:
             return np.zeros((0, 3), dtype=np.float32)
         self._ensure_geometry_metadata(raw_obs)
+
+        if self._multi_object_geom_mode:
+            chunks = []
+            for spec in self._multi_object_specs:
+                points = np.asarray(
+                    self._env.sim.data.geom_xpos[spec["selected_geom_ids"]], dtype=np.float32
+                )
+                chunks.append(points)
+
+            if len(chunks) == 0:
+                points = np.zeros((self._num_object_points, 3), dtype=np.float32)
+            else:
+                points = np.concatenate(chunks, axis=0).astype(np.float32)
+                if points.shape[0] < self._num_object_points:
+                    pad = np.repeat(
+                        points[-1:],
+                        self._num_object_points - points.shape[0],
+                        axis=0,
+                    )
+                    points = np.concatenate([points, pad], axis=0)
+                elif points.shape[0] > self._num_object_points:
+                    points = points[: self._num_object_points]
+            return points.astype(np.float32)
 
         target_pos, target_quat = self._extract_body_pose(
             raw_obs, self._target_object_name, self._target_body_id

@@ -4,7 +4,6 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=04:00:00
 #SBATCH --output=point_policy_rl/experiments_rl/libero_spatial/slurm_logs/%x_%j.out
 #SBATCH --error=point_policy_rl/experiments_rl/libero_spatial/slurm_logs/%x_%j.err
 

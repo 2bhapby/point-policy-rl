@@ -20,6 +20,10 @@ def _suite_make_module_name(suite_name: str) -> str:
         return "suite.libero_spatial"
     if suite_name in {"libero_object", "object"}:
         return "suite.libero_object"
+    if suite_name in {"libero_spatial_basefix_v1", "spatial_basefix_v1"}:
+        return "suite.libero_spatial_basefix_v1"
+    if suite_name in {"libero_object_basefix_v1", "object_basefix_v1"}:
+        return "suite.libero_object_basefix_v1"
     raise ValueError(f"Unsupported suite: {suite_name}")
 
 
@@ -218,6 +222,22 @@ def _extract_suite_block(cfg: dict[str, Any]) -> dict[str, Any]:
     return suite_cfg
 
 
+def _coerce_bool_flag(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
 def _build_make_kwargs(
     cfg: dict[str, Any],
     suite_override: str | None,
@@ -313,16 +333,24 @@ def build_single_env_from_bc_config(
     pixel_keys = list(suite_cfg.get("pixel_keys", ["pixels1", "pixels2"]))
     pixel_key = pixel_keys[0]
 
-    max_delta_pos = float(suite_cfg.get("max_delta_pos", 0.05))
-    max_delta_rot = float(suite_cfg.get("max_delta_rot", 0.25))
-    low = np.array(
-        [-max_delta_pos, -max_delta_pos, -max_delta_pos, -max_delta_rot, -max_delta_rot, -max_delta_rot, -1.0],
-        dtype=np.float32,
+    normalize_delta_action_to_osc = _coerce_bool_flag(
+        suite_cfg.get("normalize_delta_action_to_osc", False), default=False
     )
-    high = np.array(
-        [max_delta_pos, max_delta_pos, max_delta_pos, max_delta_rot, max_delta_rot, max_delta_rot, 1.0],
-        dtype=np.float32,
-    )
+    if normalize_delta_action_to_osc:
+        # In basefix_v1 line, point2action returns OSC-normalized action in [-1, 1].
+        low = np.array([-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float32)
+        high = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    else:
+        max_delta_pos = float(suite_cfg.get("max_delta_pos", 0.05))
+        max_delta_rot = float(suite_cfg.get("max_delta_rot", 0.25))
+        low = np.array(
+            [-max_delta_pos, -max_delta_pos, -max_delta_pos, -max_delta_rot, -max_delta_rot, -max_delta_rot, -1.0],
+            dtype=np.float32,
+        )
+        high = np.array(
+            [max_delta_pos, max_delta_pos, max_delta_pos, max_delta_rot, max_delta_rot, max_delta_rot, 1.0],
+            dtype=np.float32,
+        )
 
     env = envs[0]
     task_desc = task_descriptions[0] if len(task_descriptions) > 0 else ""

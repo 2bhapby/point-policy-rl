@@ -14,6 +14,9 @@ def _resolve_demo_file(
     suite_name: str,
     task_name: str,
 ) -> Path:
+    if demo_root.is_file():
+        return demo_root
+
     candidate_paths = [
         demo_root / f"{task_name}.pkl",
         demo_root / suite_name / f"{task_name}.pkl",
@@ -30,6 +33,85 @@ def _resolve_demo_file(
     raise FileNotFoundError(
         f"Offline demo pkl not found for task '{task_name}' under: {demo_root}"
     )
+
+
+def _stack_observation_sequence(
+    obs_seq: list[dict[str, Any]],
+) -> dict[str, np.ndarray]:
+    stacked: dict[str, np.ndarray] = {}
+    if len(obs_seq) == 0:
+        return stacked
+
+    keys = set()
+    for obs in obs_seq:
+        if isinstance(obs, dict):
+            keys.update(obs.keys())
+
+    for key in sorted(keys):
+        values = []
+        valid = True
+        for obs in obs_seq:
+            if not isinstance(obs, dict) or key not in obs:
+                valid = False
+                break
+            values.append(np.asarray(obs[key]))
+        if not valid or len(values) == 0:
+            continue
+        try:
+            stacked[key] = np.stack(values, axis=0)
+        except Exception:
+            continue
+    return stacked
+
+
+def _convert_rlds_episodes_to_observations(
+    episodes: list[Any],
+    low: np.ndarray,
+    high: np.ndarray,
+) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    low = np.asarray(low, dtype=np.float32).reshape(7)
+    high = np.asarray(high, dtype=np.float32).reshape(7)
+
+    for episode in episodes:
+        if not isinstance(episode, dict):
+            continue
+        steps = episode.get("steps")
+        if not isinstance(steps, list) or len(steps) < 2:
+            continue
+
+        obs_seq: list[dict[str, Any]] = []
+        actions: list[np.ndarray] = []
+        has_all_actions = True
+
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            obs = step.get("observation")
+            if not isinstance(obs, dict):
+                continue
+            obs_seq.append(obs)
+
+            raw_action = step.get("action", None)
+            if raw_action is None:
+                has_all_actions = False
+                continue
+            action_arr = np.asarray(raw_action, dtype=np.float32).reshape(-1)
+            if action_arr.size < 7:
+                has_all_actions = False
+                continue
+            actions.append(np.clip(action_arr[:7], low, high).astype(np.float32))
+
+        if len(obs_seq) < 2:
+            continue
+
+        demo_obs = _stack_observation_sequence(obs_seq)
+        if has_all_actions and len(actions) == len(obs_seq):
+            demo_obs["actions"] = np.stack(actions, axis=0).astype(np.float32)
+
+        converted.append(demo_obs)
+
+    return converted
 
 
 def _slice_observation_step(demo_obs: dict[str, Any], t: int) -> dict[str, Any]:
@@ -194,16 +276,25 @@ def build_offline_transitions_from_expert_demos_rl(
 
     with demo_pkl_path.open("rb") as f:
         payload = pkl.load(f)
-    if not isinstance(payload, dict) or "observations" not in payload:
-        raise ValueError(f"Unsupported offline demo format: {demo_pkl_path}")
-
-    observations = payload["observations"]
-    if not isinstance(observations, list):
-        raise ValueError(f"'observations' must be a list in {demo_pkl_path}")
 
     low = np.asarray(low, dtype=np.float32).reshape(7)
     high = np.asarray(high, dtype=np.float32).reshape(7)
     point_key = f"point_tracks_{pixel_key}"
+
+    observations: list[dict[str, Any]] | None = None
+    if isinstance(payload, dict) and isinstance(payload.get("observations"), list):
+        observations = payload["observations"]
+    elif isinstance(payload, dict) and isinstance(payload.get("episodes"), list):
+        observations = _convert_rlds_episodes_to_observations(
+            episodes=payload["episodes"],
+            low=low,
+            high=high,
+        )
+    else:
+        raise ValueError(f"Unsupported offline demo format: {demo_pkl_path}")
+
+    if not isinstance(observations, list):
+        raise ValueError(f"'observations' must be a list in {demo_pkl_path}")
 
     mode = str(base_action_mode).strip().lower()
     if mode not in {"demo_delta", "bc_track_delta"}:

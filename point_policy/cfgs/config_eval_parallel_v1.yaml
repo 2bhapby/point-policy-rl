@@ -1,0 +1,57 @@
+defaults:
+  - _self_
+  - agent: point_policy_parallel_v1
+  - suite: libero_spatial_parallel_v1
+  - dataloader: libero_spatial_parallel_v1
+  - override hydra/launcher: basic
+
+# Dir
+root_dir: /path/to/dir
+data_dir: /path/to/expert_demos
+
+# misc
+seed: 2
+device: cuda
+save_video: true
+video_render_size: 640
+video_flip_vertical: true
+video_export_enabled: false
+video_export_dir: "point_policy/exp_local/eval_videos_parallel_v1"
+video_export_tag: ""
+point_overlay: true
+point_overlay_side_by_side: true
+point_overlay_radius: 3
+use_tb: true
+batch_size: 64
+point_debug: true
+point_debug_max_steps: 20
+eval_max_episode_len: 200
+eval_rollout_steps: 200
+offline_gt_points_only: false
+offline_demo_index: 0
+offline_max_steps: -1
+
+# experiment
+num_demos_per_task: 100
+policy_head: deterministic
+use_proprio: false
+eval: true
+experiment: eval_parallel_v1
+experiment_label: ${policy_head}_parallel_v1
+
+# action chunking
+temporal_agg: true # aggregate actions over time
+num_queries: 20
+
+# expert dataset
+expert_dataset: ${dataloader.bc_dataset}
+
+# Load weights
+bc_weight: path/to/weight
+
+hydra:
+  run:
+    dir: ./exp_local/eval/${now:%Y.%m.%d}_${experiment}/${experiment_label}/${now:%H%M%S}_hidden_dim_${suite.hidden_dim}
+  sweep:
+    dir: ./exp_local/${now:%Y.%m.%d}/${now:%H%M%S}
+    subdir: ${hydra.job.num}

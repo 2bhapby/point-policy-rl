@@ -8,6 +8,30 @@ from torch.utils.data import IterableDataset
 from scipy.spatial.transform import Rotation as R
 
 
+def _parse_robot_point_indices(robot_point_indices):
+    if robot_point_indices is None:
+        return None
+    if isinstance(robot_point_indices, str):
+        text = robot_point_indices.strip()
+        if text == "" or text.lower() in {"none", "null"}:
+            return None
+        text = text.strip("[]")
+        if text == "":
+            return []
+        indices = [int(token.strip()) for token in text.split(",") if token.strip() != ""]
+    elif isinstance(robot_point_indices, (list, tuple, np.ndarray)):
+        indices = [int(v) for v in robot_point_indices]
+    elif hasattr(robot_point_indices, "__iter__"):
+        indices = [int(v) for v in robot_point_indices]
+    else:
+        raise TypeError(
+            "robot_point_indices must be None, string, list, tuple, or numpy array"
+        )
+    if len(indices) != len(set(indices)):
+        raise ValueError(f"robot_point_indices must be unique, got {indices}")
+    return indices
+
+
 class BCDataset(IterableDataset):
     def __init__(
         self,
@@ -29,8 +53,17 @@ class BCDataset(IterableDataset):
         subsample,
         skip_first_n,
         gt_depth,
+        gripper_label_mode="command",
+        robot_point_indices=None,
     ):
-        tasks = [tasks]  # NOTE: single task for now
+        if isinstance(tasks, str):
+            tasks = [task.strip() for task in tasks.split(",") if task.strip()]
+        elif isinstance(tasks, (list, tuple)):
+            tasks = [str(task).strip() for task in tasks if str(task).strip()]
+        else:
+            raise TypeError("tasks must be a string, list, or tuple")
+        if len(tasks) == 0:
+            raise ValueError("tasks cannot be empty")
 
         self._history = history
         self._history_len = history_len if history else 1
@@ -42,10 +75,45 @@ class BCDataset(IterableDataset):
         # track points
         self._use_robot_points = use_robot_points
         self._num_robot_points = num_robot_points
+        self._robot_point_indices = _parse_robot_point_indices(robot_point_indices)
+        if self._use_robot_points and self._robot_point_indices is not None:
+            if len(self._robot_point_indices) != int(self._num_robot_points):
+                raise ValueError(
+                    "robot_point_indices length must match num_robot_points. "
+                    f"got len={len(self._robot_point_indices)} "
+                    f"vs num_robot_points={self._num_robot_points}"
+                )
         self._use_object_points = use_object_points
         self._num_object_points = num_object_points
         self._point_dim = point_dim
         assert self._point_dim in [2, 3], "Point dimension must be 2 or 3"
+        self._gripper_label_mode = str(gripper_label_mode).strip().lower()
+        if self._gripper_label_mode not in {"command", "distance"}:
+            raise ValueError(
+                f"gripper_label_mode must be 'command' or 'distance', got {gripper_label_mode}"
+            )
+        if self._gripper_label_mode == "distance" and self._point_dim != 3:
+            raise ValueError("gripper_label_mode='distance' requires point_dim=3")
+        self._tip_left_local_idx = 1
+        self._tip_right_local_idx = 2
+        if self._robot_point_indices is not None:
+            if 1 in self._robot_point_indices and 2 in self._robot_point_indices:
+                self._tip_left_local_idx = self._robot_point_indices.index(1)
+                self._tip_right_local_idx = self._robot_point_indices.index(2)
+            else:
+                self._tip_left_local_idx = None
+                self._tip_right_local_idx = None
+        if (
+            self._gripper_label_mode == "distance"
+            and (
+                self._tip_left_local_idx is None
+                or self._tip_right_local_idx is None
+            )
+        ):
+            raise ValueError(
+                "gripper_label_mode='distance' requires robot points to include "
+                "kp1_tip_left(index 1) and kp2_tip_right(index 2)."
+            )
         self._robot_points_key = (
             "robot_tracks" if self._point_dim == 2 else "robot_tracks_3d"
         )
@@ -80,6 +148,7 @@ class BCDataset(IterableDataset):
         self._max_state_dim = 0
         self._num_samples = 0
         min_track, max_track = None, None
+        min_gripper, max_gripper = None, None
         for _path_idx in self._paths:
             print(f"Loading {str(self._paths[_path_idx])}")
             # read
@@ -94,6 +163,26 @@ class BCDataset(IterableDataset):
                 if skip_first_n is not None:
                     for key in observations[i].keys():
                         observations[i][key] = observations[i][key][skip_first_n:]
+
+                # Optionally use physical finger-tip distance as gripper supervision.
+                if self._gripper_label_mode == "distance":
+                    track_key = f"{self._robot_points_key}_{self._pixel_keys[0]}"
+                    if track_key not in observations[i]:
+                        raise KeyError(
+                            f"{track_key} not found while computing gripper distance labels"
+                        )
+                    robot_pts = np.asarray(observations[i][track_key], dtype=np.float32)
+                    robot_pts = self._select_robot_points(robot_pts)
+                    if robot_pts.ndim != 3 or robot_pts.shape[1] < 3:
+                        raise ValueError(
+                            f"Invalid robot track shape for {track_key}: {robot_pts.shape}"
+                        )
+                    gripper_distance = np.linalg.norm(
+                        robot_pts[:, self._tip_left_local_idx, :3]
+                        - robot_pts[:, self._tip_right_local_idx, :3],
+                        axis=-1,
+                    ).astype(np.float32)
+                    observations[i]["gripper_states"] = gripper_distance
 
                 # Repeat last dimension of each observation for history_len times
                 for key in observations[i].keys():
@@ -120,12 +209,24 @@ class BCDataset(IterableDataset):
                 )
                 self._max_state_dim = self._num_robot_points * self._point_dim
                 self._num_samples += len(observations[i][self._pixel_keys[0]])
+                gripper = np.asarray(observations[i]["gripper_states"], dtype=np.float32)
+                gripper = gripper.reshape(-1)
+                min_gripper = (
+                    min(min_gripper, float(np.min(gripper)))
+                    if min_gripper is not None
+                    else float(np.min(gripper))
+                )
+                max_gripper = (
+                    max(max_gripper, float(np.max(gripper)))
+                    if max_gripper is not None
+                    else float(np.max(gripper))
+                )
 
                 # min, max track
                 for pixel_key in self._pixel_keys:
                     if self._use_robot_points:
                         track_key = f"{self._robot_points_key}_{pixel_key}"
-                        track = observations[i][track_key]
+                        track = self._select_robot_points(observations[i][track_key])
                         track = einops.rearrange(track, "t n d -> (t n) d")
                         min_track = (
                             np.minimum(min_track, np.min(track, axis=0))
@@ -152,6 +253,12 @@ class BCDataset(IterableDataset):
                             else np.max(track, axis=0)
                         )
 
+        if min_gripper is None or max_gripper is None:
+            min_gripper, max_gripper = -1.0, 1.0
+        if abs(max_gripper - min_gripper) < 1e-6:
+            min_gripper -= 1.0
+            max_gripper += 1.0
+
         self.stats = {
             "past_tracks": {
                 "min": min_track,
@@ -166,8 +273,8 @@ class BCDataset(IterableDataset):
                 ),
             },
             "gripper_states": {
-                "min": -2.0,
-                "max": 2.0,
+                "min": float(min_gripper),
+                "max": float(max_gripper),
             },
         }
 
@@ -194,6 +301,30 @@ class BCDataset(IterableDataset):
 
         # Samples from envs
         self.envs_till_idx = len(self._episodes)
+
+    def _select_robot_points(self, track):
+        track = np.asarray(track)
+        if track.ndim < 2:
+            return track
+        if self._robot_point_indices is not None:
+            max_idx = int(track.shape[1]) - 1
+            invalid = [
+                idx for idx in self._robot_point_indices if idx < 0 or idx > max_idx
+            ]
+            if invalid:
+                raise IndexError(
+                    f"robot_point_indices out of range for track with {track.shape[1]} "
+                    f"points. invalid={invalid}"
+                )
+            return track[:, self._robot_point_indices]
+
+        num_points = int(self._num_robot_points)
+        if int(track.shape[1]) < num_points:
+            raise ValueError(
+                f"track has fewer points ({track.shape[1]}) than "
+                f"num_robot_points={num_points}"
+            )
+        return track[:, -num_points:]
 
     def _sample_episode(self, env_idx=None):
         if env_idx is not None:
@@ -222,20 +353,21 @@ class BCDataset(IterableDataset):
 
         if self._use_robot_points:
             track_key = f"{self._robot_points_key}_{pixel_key}"
-            num_points = self._num_robot_points
             robot_points = observations[track_key][
                 max(
                     0,
                     sample_idx - self._history_len * self._subsample + self._subsample,
                 ) : sample_idx
                 + 1 : self._subsample
-            ][:, -num_points:]
+            ]
+            robot_points = self._select_robot_points(robot_points)
             if len(robot_points) < self._history_len:
                 prior = np.array(
                     [robot_points[0]] * (self._history_len - len(robot_points))
                 )
                 robot_points = np.concatenate([prior, robot_points], axis=0)
             past_tracks.append(robot_points)
+            num_points = int(robot_points.shape[1])
             action_mask.extend([1] * num_points)
 
         if self._use_object_points:
@@ -283,10 +415,8 @@ class BCDataset(IterableDataset):
 
         if self._use_robot_points:
             track_key = f"{self._robot_points_key}_{pixel_key}"
-            num_points = self._num_robot_points
-            ft = observations[track_key][start_idx : end_idx : self._subsample][
-                :, -num_points:
-            ]
+            ft = observations[track_key][start_idx : end_idx : self._subsample]
+            ft = self._select_robot_points(ft)
             if len(ft) < num_future_tracks:
                 post = np.array([ft[-1]] * (num_future_tracks - len(ft)))
                 ft = np.concatenate([ft, post], axis=0)

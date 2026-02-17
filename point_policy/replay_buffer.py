@@ -1,4 +1,5 @@
 import random
+import os
 import numpy as np
 import torch
 
@@ -10,11 +11,12 @@ def _worker_init_fn(worker_id):
 
 
 def make_expert_replay_loader(iterable, batch_size):
+    num_workers = int(os.environ.get("POINT_POLICY_NUM_WORKERS", "2"))
     loader = torch.utils.data.DataLoader(
         iterable,
         batch_size=batch_size,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=num_workers > 0,
         worker_init_fn=_worker_init_fn,
     )
     return loader

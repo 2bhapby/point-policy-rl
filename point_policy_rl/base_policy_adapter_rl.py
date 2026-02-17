@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +77,16 @@ class FrozenPointPolicyBaseRL:
 
         import torch
         import utils as pp_utils
-        from agent.point_policy import BCAgent
+        agent_cfg = self.cfg.get("agent", {}) if isinstance(self.cfg, dict) else {}
+        target = str(agent_cfg.get("_target_", "agent.point_policy.BCAgent")).strip()
+        if "." not in target:
+            raise ValueError(f"Invalid agent target: {target}")
+        module_name, class_name = target.rsplit(".", 1)
+        try:
+            agent_mod = importlib.import_module(module_name)
+            BCAgent = getattr(agent_mod, class_name)
+        except Exception as exc:
+            raise ImportError(f"Failed to import BC agent target '{target}': {exc}") from exc
 
         self._pp_utils = pp_utils
 

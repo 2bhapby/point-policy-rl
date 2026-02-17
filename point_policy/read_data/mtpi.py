@@ -73,7 +73,14 @@ class BCDataset(IterableDataset):
         subsample,
         skip_first_n,
     ):
-        tasks = [tasks]  # NOTE: single task for now
+        if isinstance(tasks, str):
+            tasks = [task.strip() for task in tasks.split(",") if task.strip()]
+        elif isinstance(tasks, (list, tuple)):
+            tasks = [str(task).strip() for task in tasks if str(task).strip()]
+        else:
+            raise TypeError("tasks must be a string, list, or tuple")
+        if len(tasks) == 0:
+            raise ValueError("tasks cannot be empty")
 
         self._history = history
         self._history_len = history_len if history else 1

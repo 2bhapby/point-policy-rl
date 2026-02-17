@@ -1,0 +1,147 @@
+# @package suite
+defaults:
+  - _self_
+  - task: libero_spatial
+
+suite: libero_spatial_basefix_v1
+name: "libero_spatial_basefix_v1"
+
+# obs dims
+img_size: [128, 128] # (width, height)
+use_robot_points: true
+num_robot_points: 9
+robot_point_indices: null
+gt_depth: false
+
+# action compute
+point_dim: 3
+max_delta_pos: 0.05
+pose_delta_gain: 1.0
+pose_solve_mode: rigid
+max_delta_rot: 0.25
+normalize_delta_action_to_osc: true
+controller_output_max_pos: 0.05
+controller_output_max_rot: 0.5
+gripper_label_mode: command
+gripper_threshold: 0.0
+gripper_close_threshold: 0.2
+gripper_open_threshold: -0.2
+gripper_bias: 0.0
+gripper_qpos_close_threshold: 0.02
+gripper_distance_close_threshold: 0.07
+gripper_distance_open_threshold: 0.08
+gripper_distance_control_mode: threshold
+gripper_distance_value_source: pred_points
+gripper_distance_deadband: 0.004
+gripper_cmd_slew_rate: 2.0
+gripper_close_position_gate: false
+gripper_close_position_threshold: 0.02
+gripper_close_object_gate: false
+gripper_close_object_threshold: 0.06
+gripper_close_object_point: tip_mid
+# Real-safe mode: disable simulator-only object GT distance gates in policy logic.
+real_deploy_mode: true
+gripper_command_fallback_to_tip_distance: false
+gripper_reopen_tip_gate: false
+gripper_tip_close_threshold: 0.07
+gripper_tip_open_threshold: 0.08
+gripper_min_hold_steps: 12
+gripper_close_debounce_steps: 0
+gripper_open_debounce_steps: 0
+gripper_force_close_on_align: false
+gripper_force_close_align_steps: 0
+close_downward_offset: 0.0
+close_approach_offset: 0.0
+close_approach_steps: 8
+object_bottom_at_origin: false
+
+# object points
+use_object_points: true
+num_object_points: 10
+object_point_mode: geom_fps
+
+# task settings
+action_repeat: 1
+hidden_dim: 256
+
+# train settings
+num_train_steps: 100100
+log_every_steps: 100
+save_every_steps: 10000
+history: true
+history_len: 10
+
+# eval
+eval_every_steps: 200000
+num_eval_episodes: 5
+eval_history_len: 10
+
+# data loading
+action_after_steps: 1
+
+# obs_keys
+pixel_keys: ["pixels1", "pixels2"]
+proprio_key: "proprioceptive"
+feature_key: "features"
+
+# snapshot
+save_snapshot: true
+
+task_make_fn:
+  _target_: suite.libero_spatial_basefix_v1.make
+  task_name: ${suite.task.task_name}
+  benchmark_name: ${suite.task.benchmark_name}
+  task_order_index: ${suite.task.task_order_index}
+  action_repeat: ${suite.action_repeat}
+  seed: ${seed}
+  height: ${suite.img_size[1]}
+  width: ${suite.img_size[0]}
+  max_episode_len: ??? # to be specified later
+  max_state_dim: ??? # to be specified later
+  pixel_keys: ${suite.pixel_keys}
+  eval: ${eval}
+  use_robot_points: ${suite.use_robot_points}
+  num_robot_points: ${suite.num_robot_points}
+  robot_point_indices: ${suite.robot_point_indices}
+  use_object_points: ${suite.use_object_points}
+  num_object_points: ${suite.num_object_points}
+  object_point_mode: ${suite.object_point_mode}
+  point_dim: ${suite.point_dim}
+  max_delta_pos: ${suite.max_delta_pos}
+  pose_delta_gain: ${suite.pose_delta_gain}
+  pose_solve_mode: ${suite.pose_solve_mode}
+  max_delta_rot: ${suite.max_delta_rot}
+  normalize_delta_action_to_osc: ${suite.normalize_delta_action_to_osc}
+  controller_output_max_pos: ${suite.controller_output_max_pos}
+  controller_output_max_rot: ${suite.controller_output_max_rot}
+  gripper_label_mode: ${suite.gripper_label_mode}
+  gripper_threshold: ${suite.gripper_threshold}
+  gripper_close_threshold: ${suite.gripper_close_threshold}
+  gripper_open_threshold: ${suite.gripper_open_threshold}
+  gripper_bias: ${suite.gripper_bias}
+  gripper_qpos_close_threshold: ${suite.gripper_qpos_close_threshold}
+  gripper_distance_close_threshold: ${suite.gripper_distance_close_threshold}
+  gripper_distance_open_threshold: ${suite.gripper_distance_open_threshold}
+  gripper_distance_control_mode: ${suite.gripper_distance_control_mode}
+  gripper_distance_value_source: ${suite.gripper_distance_value_source}
+  gripper_distance_deadband: ${suite.gripper_distance_deadband}
+  gripper_cmd_slew_rate: ${suite.gripper_cmd_slew_rate}
+  gripper_close_position_gate: ${suite.gripper_close_position_gate}
+  gripper_close_position_threshold: ${suite.gripper_close_position_threshold}
+  gripper_close_object_gate: ${suite.gripper_close_object_gate}
+  gripper_close_object_threshold: ${suite.gripper_close_object_threshold}
+  gripper_close_object_point: ${suite.gripper_close_object_point}
+  real_deploy_mode: ${suite.real_deploy_mode}
+  gripper_command_fallback_to_tip_distance: ${suite.gripper_command_fallback_to_tip_distance}
+  gripper_reopen_tip_gate: ${suite.gripper_reopen_tip_gate}
+  gripper_tip_close_threshold: ${suite.gripper_tip_close_threshold}
+  gripper_tip_open_threshold: ${suite.gripper_tip_open_threshold}
+  gripper_min_hold_steps: ${suite.gripper_min_hold_steps}
+  gripper_close_debounce_steps: ${suite.gripper_close_debounce_steps}
+  gripper_open_debounce_steps: ${suite.gripper_open_debounce_steps}
+  gripper_force_close_on_align: ${suite.gripper_force_close_on_align}
+  gripper_force_close_align_steps: ${suite.gripper_force_close_align_steps}
+  close_downward_offset: ${suite.close_downward_offset}
+  close_approach_offset: ${suite.close_approach_offset}
+  close_approach_steps: ${suite.close_approach_steps}
+  object_bottom_at_origin: ${suite.object_bottom_at_origin}

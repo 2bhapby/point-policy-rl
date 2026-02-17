@@ -1,0 +1,97 @@
+{
+  "schema_version": "offline_buffer_meta_rl.v1",
+  "dataset_id": "<run_or_dataset_name>",
+  "created_at": "<YYYY-MM-DDTHH:MM:SSZ>",
+  "owner": "<user>",
+  "notes": "Point-Policy base-generated offline buffer for residual RL",
+
+  "hard_constraints": {
+    "offpolicy_rl_requires_action": true,
+    "required_transition_keys": [
+      "obs",
+      "action",
+      "reward",
+      "next_obs",
+      "done"
+    ]
+  },
+
+  "pipeline": {
+    "base_policy_frozen": true,
+    "residual_policy_trainable": true,
+    "action_merge_rule": "a_final = clip(a_base + a_residual, low, high)",
+    "offline_action_source": "base_policy_generated",
+    "offline_success_only": true,
+    "online_store_all_transitions": true
+  },
+
+  "data_sources": {
+    "suite": "libero_spatial",
+    "task_name": "<task_name>",
+    "demo_pkl_path": "<path/to/demo.pkl>",
+    "demo_has_robot_actions": false,
+    "base_checkpoint_path": "<path/to/base_ckpt.pt>",
+    "base_config_path": "<path/to/base_config.yaml>"
+  },
+
+  "state_spec": {
+    "builder": "observation_to_state",
+    "pixel_key": "pixels1",
+    "include_eef_pos": false,
+    "state_parts_in_order": [
+      "point_tracks_flatten",
+      "gripper_state",
+      "base_action_7d"
+    ],
+    "state_parts_in_order_when_include_eef_pos_true": [
+      "point_tracks_flatten",
+      "gripper_state",
+      "eef_pos_3d",
+      "base_action_7d"
+    ]
+  },
+
+  "action_spec": {
+    "action_dim": 7,
+    "action_semantics": "robot_delta_pos3_delta_rot3_gripper1",
+    "offline_transition_action_mode": "combined_base",
+    "offline_base_action_mode": "bc_track_delta",
+    "store_aux_fields": [
+      "base_action",
+      "next_base_action"
+    ]
+  },
+
+  "reward_spec": {
+    "sparse_reward": true,
+    "success_done_reward": 1.0,
+    "fail_reward": 0.0,
+    "truncate_reward": 0.0,
+    "done_condition": "terminal_step_of_success_episode"
+  },
+
+  "buffer_spec": {
+    "offline_fraction": 0.5,
+    "offline_max_demos": 50,
+    "sampling_strategy": "uniform_or_prioritized",
+    "n_step": 3,
+    "gamma": 0.99
+  },
+
+  "generation_stats": {
+    "num_source_episodes": 0,
+    "num_selected_success_episodes": 0,
+    "num_offline_transitions": 0,
+    "mean_episode_len": 0.0,
+    "max_episode_len": 0,
+    "min_episode_len": 0
+  },
+
+  "integrity_checks": {
+    "transition_key_check_passed": false,
+    "shape_check_passed": false,
+    "action_not_all_zero_check_passed": false,
+    "done_reward_consistency_passed": false,
+    "base_action_recomputed_during_training": false
+  }
+}

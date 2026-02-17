@@ -11,6 +11,7 @@ from pathlib import Path
 import hydra
 import torch
 import numpy as np
+from hydra.core.hydra_config import HydraConfig
 
 import utils
 from logger import Logger
@@ -35,7 +36,11 @@ def make_agent(obs_spec, action_spec, cfg):
 
 class WorkspaceIL:
     def __init__(self, cfg):
-        self.work_dir = Path.cwd()
+        try:
+            self.work_dir = Path(HydraConfig.get().runtime.output_dir).resolve()
+        except Exception:
+            self.work_dir = Path.cwd().resolve()
+        self.work_dir.mkdir(parents=True, exist_ok=True)
         print(f"workspace: {self.work_dir}")
 
         self.cfg = cfg
@@ -163,7 +168,7 @@ class WorkspaceIL:
         self.agent.load_snapshot(agent_payload, eval=True)
 
 
-@hydra.main(config_path="cfgs", config_name="config_eval")
+@hydra.main(config_path="cfgs", config_name="config_eval", version_base=None)
 def main(cfg):
     from eval import WorkspaceIL as W
 

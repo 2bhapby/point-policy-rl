@@ -30,10 +30,13 @@ class Actor(nn.Module):
         self._policy_head = policy_head
         self._repr_dim = repr_dim
         self._act_dim = act_dim
+        # GPT context length must cover all point tokens (and optional gripper token).
+        track_block_size = int(num_track_points) + (1 if bool(pred_gripper) else 0)
+        block_size = max(20, track_block_size)
 
         self._policy = GPT(
             GPTConfig(
-                block_size=20,
+                block_size=block_size,
                 input_dim=repr_dim,
                 output_dim=hidden_dim,
                 n_layer=4,

@@ -15,6 +15,15 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+try:
+    import imageio.v2 as imageio
+except Exception:  # pragma: no cover
+    imageio = None
+
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
 
 # Allow `python point_policy_rl/train_resfit_residual_td3_rl.py` execution.
 _THIS_DIR = Path(__file__).resolve().parent
@@ -37,8 +46,30 @@ def parse_args() -> argparse.Namespace:
         description="Residual TD3 using ResFiT QAgent + TorchRL replay (isolated _rl path)"
     )
     parser.add_argument("--bc-weight", type=str, required=True)
-    parser.add_argument("--suite", type=str, default=None, choices=["libero_spatial", "libero_object"])
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default=None,
+        choices=[
+            "libero_spatial",
+            "libero_object",
+            "libero_spatial_basefix_v1",
+            "libero_object_basefix_v1",
+        ],
+    )
     parser.add_argument("--task-name", type=str, default=None)
+    parser.add_argument(
+        "--benchmark-name",
+        type=str,
+        default="",
+        help="Optional benchmark override (e.g., LIBERO_SPATIAL, LIBERO_10).",
+    )
+    parser.add_argument(
+        "--task-order-index",
+        type=int,
+        default=-1,
+        help="Optional task_order_index override. -1 means keep checkpoint config value.",
+    )
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
@@ -77,8 +108,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-gradient-type", type=str, default="ensemble_mean")
 
     parser.add_argument("--offline-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--offline-source",
+        type=str,
+        default="expert_demo",
+        choices=["expert_demo", "base_rollout"],
+        help="Source used to initialize offline buffer.",
+    )
     parser.add_argument("--offline-demo-root", type=str, default="")
     parser.add_argument("--offline-max-demos", type=int, default=0)
+    parser.add_argument(
+        "--offline-rollout-episodes",
+        type=int,
+        default=0,
+        help="Target episodes for offline collection when --offline-source=base_rollout. "
+        "If <=0, falls back to offline_max_demos, then 50.",
+    )
+    parser.add_argument(
+        "--offline-rollout-max-attempt-mult",
+        type=int,
+        default=20,
+        help="Max collection attempts = target_episodes * this value (base_rollout mode).",
+    )
+    parser.add_argument(
+        "--offline-success-only",
+        action="store_true",
+        help="Keep only successful episodes in offline collection.",
+    )
     parser.add_argument("--offline-step-reward", type=float, default=0.0)
     parser.add_argument("--offline-terminal-reward", type=float, default=1.0)
     parser.add_argument(
@@ -89,14 +145,50 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--include-eef-pos", action="store_true")
-    parser.add_argument("--env-max-episode-len", type=int, default=300)
+    parser.add_argument("--env-max-episode-len", type=int, default=3000)
     parser.add_argument("--dummy-image-size", type=int, default=84)
     parser.add_argument("--camera-key", type=str, default="observation.images.agentview")
+    parser.add_argument(
+        "--suite-gripper-close-position-gate",
+        type=str,
+        default="",
+        help="Optional override for suite.gripper_close_position_gate (e.g., true/false)",
+    )
+    parser.add_argument(
+        "--suite-gripper-cmd-slew-rate",
+        type=float,
+        default=None,
+        help="Optional override for suite.gripper_cmd_slew_rate",
+    )
 
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--eval-episodes", type=int, default=5)
+    parser.add_argument("--eval-save-video", action="store_true")
+    parser.add_argument("--eval-video-dir", type=str, default="")
+    parser.add_argument("--eval-video-fps", type=int, default=20)
+    parser.add_argument("--eval-video-render-size", type=int, default=256)
+    parser.add_argument("--eval-video-max-episodes", type=int, default=1)
+    parser.add_argument("--eval-video-online-every-episodes", type=int, default=10)
+    parser.add_argument("--eval-video-tag", type=str, default="")
     parser.add_argument("--save-every", type=int, default=10000)
     parser.add_argument("--log-every", type=int, default=200)
+    parser.add_argument(
+        "--strict-resfit",
+        action="store_true",
+        help="Enable strict ResFiT recipe/runtime checks (fail fast on mismatch).",
+    )
+    parser.add_argument(
+        "--strict-max-residual-action-scale",
+        type=float,
+        default=0.5,
+        help="Upper bound for residual action scale when --strict-resfit is enabled.",
+    )
+    parser.add_argument(
+        "--strict-max-random-action-noise-scale",
+        type=float,
+        default=0.5,
+        help="Upper bound for random warmup residual scale when --strict-resfit is enabled.",
+    )
 
     parser.add_argument("--wandb-enable", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="point-policy-residual-rl")
@@ -138,6 +230,196 @@ class LinearActionNormalizerRL:
         action_norm = np.asarray(action_norm, dtype=np.float32).reshape(self.center.shape)
         action_raw = action_norm * self.scale + self.center
         return np.clip(action_raw, self.low, self.high).astype(np.float32)
+
+
+def _assert_strict_resfit_args(args: argparse.Namespace) -> None:
+    if not bool(args.strict_resfit):
+        return
+
+    def _close(a: float, b: float, tol: float = 1e-12) -> bool:
+        return abs(float(a) - float(b)) <= tol
+
+    errors: list[str] = []
+    if not _close(float(args.offline_fraction), 0.5):
+        errors.append(
+            f"offline_fraction must be 0.5 (got {args.offline_fraction})"
+        )
+    if not _close(float(args.critic_target_tau), 0.005):
+        errors.append(
+            f"critic_target_tau must be 0.005 (got {args.critic_target_tau})"
+        )
+    if float(args.residual_action_scale) > float(args.strict_max_residual_action_scale):
+        errors.append(
+            "residual_action_scale exceeds strict bound "
+            f"({args.residual_action_scale} > {args.strict_max_residual_action_scale})"
+        )
+    if float(args.random_action_noise_scale) > float(args.strict_max_random_action_noise_scale):
+        errors.append(
+            "random_action_noise_scale exceeds strict bound "
+            f"({args.random_action_noise_scale} > {args.strict_max_random_action_noise_scale})"
+        )
+
+    if errors:
+        msg = "\n".join([f"[strict-resfit] {e}" for e in errors])
+        raise ValueError(msg)
+
+    print(
+        "[strict-resfit] enabled: "
+        "offline_fraction=0.5 critic_target_tau=0.005 "
+        f"residual_action_scale<={args.strict_max_residual_action_scale} "
+        f"random_action_noise_scale<={args.strict_max_random_action_noise_scale}"
+    )
+
+
+def _action_diag(base_norm: np.ndarray, residual_norm: np.ndarray) -> dict[str, float]:
+    base_norm = np.asarray(base_norm, dtype=np.float32).reshape(-1)
+    residual_norm = np.asarray(residual_norm, dtype=np.float32).reshape(-1)
+    pre = base_norm + residual_norm
+    post = np.clip(pre, -1.0, 1.0)
+    clip_mask = (pre < -1.0) | (pre > 1.0)
+    base_in = (base_norm >= -1.0) & (base_norm <= 1.0)
+    residual_induced = clip_mask & base_in
+
+    base_l2 = float(np.linalg.norm(base_norm))
+    res_l2 = float(np.linalg.norm(residual_norm))
+    return {
+        "clip_rate_dim": float(clip_mask.mean()),
+        "clip_any": float(clip_mask.any()),
+        "residual_induced_clip_rate_dim": float(residual_induced.mean()),
+        "base_norm_l2": base_l2,
+        "residual_norm_l2": res_l2,
+        "res_over_base": float(res_l2 / (base_l2 + 1e-6)),
+        "clip_delta_l1_mean": float(np.abs(pre - post).mean()),
+        "clip_delta_linf": float(np.max(np.abs(pre - post))),
+    }
+
+
+def _get_batch_tensor(batch, keys: tuple[str, ...]):
+    # TensorDict path.
+    try:
+        return batch[keys]  # type: ignore[index]
+    except Exception:
+        pass
+
+    # Dict-like fallback path.
+    cur = batch
+    for key in keys:
+        cur = cur[key]
+    return cur
+
+
+def _assert_tensor_range(tensor, *, lo: float, hi: float, name: str) -> None:
+    tmin = float(tensor.min().item())
+    tmax = float(tensor.max().item())
+    if tmin < lo or tmax > hi:
+        raise ValueError(
+            f"[strict-resfit] {name} out of range [{lo}, {hi}] "
+            f"(min={tmin}, max={tmax})"
+        )
+
+
+def _slugify(text: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in str(text)).strip("_")
+
+
+def _normalize_frame(frame: np.ndarray, render_size: int) -> np.ndarray:
+    out = np.asarray(frame)
+    if out.ndim == 2:
+        out = np.repeat(out[..., None], 3, axis=2)
+    if out.ndim != 3:
+        raise ValueError(f"Unsupported frame ndim={out.ndim}")
+    if out.shape[2] == 1:
+        out = np.repeat(out, 3, axis=2)
+    elif out.shape[2] > 3:
+        out = out[:, :, :3]
+    if out.dtype != np.uint8:
+        out = np.clip(out, 0, 255).astype(np.uint8)
+
+    if (
+        int(render_size) > 0
+        and (out.shape[0] != int(render_size) or out.shape[1] != int(render_size))
+        and cv2 is not None
+    ):
+        out = cv2.resize(
+            out,
+            dsize=(int(render_size), int(render_size)),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    return out
+
+
+def _capture_frame(env, render_size: int) -> np.ndarray:
+    if hasattr(env, "physics"):
+        frame = env.physics.render(height=int(render_size), width=int(render_size), camera_id=0)
+    else:
+        try:
+            frame = env.render(mode="rgb_array", width=int(render_size), height=int(render_size))
+        except TypeError:
+            frame = env.render()
+    return _normalize_frame(frame, render_size=render_size)
+
+
+def _dedup_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    idx = 2
+    while True:
+        candidate = path.with_name(f"{stem}_v{idx}{suffix}")
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def _parse_bool_text(value: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean text: {value}")
+
+
+def _is_basefix_v1_suite_name(suite_name: str | None) -> bool:
+    name = str(suite_name or "").strip().lower()
+    return name in {"libero_spatial_basefix_v1", "libero_object_basefix_v1"}
+
+
+def _apply_basefix_v1_suite_preset(base_cfg: dict[str, Any], suite_name: str | None) -> list[str]:
+    suite_cfg = base_cfg.get("suite")
+    if not isinstance(suite_cfg, dict):
+        return []
+
+    canonical_suite_name = str(suite_name or "").strip()
+    if canonical_suite_name:
+        suite_cfg["suite"] = canonical_suite_name
+        suite_cfg["name"] = canonical_suite_name
+
+    # Keep RL env point2action behavior aligned with basefix_v1 line.
+    preset: dict[str, Any] = {
+        "pose_solve_mode": "rigid",
+        "pose_delta_gain": 1.0,
+        "normalize_delta_action_to_osc": True,
+        "controller_output_max_pos": 0.05,
+        "controller_output_max_rot": 0.5,
+        "max_delta_pos": 0.05,
+        "max_delta_rot": 0.25,
+        "gripper_close_threshold": 0.2,
+        "gripper_open_threshold": -0.2,
+        "gripper_cmd_slew_rate": 2.0,
+        "gripper_close_position_gate": False,
+        "gripper_distance_control_mode": "threshold",
+        "gripper_distance_value_source": "pred_points",
+        "real_deploy_mode": True,
+    }
+
+    changed: list[str] = []
+    for key, value in preset.items():
+        if suite_cfg.get(key) != value:
+            suite_cfg[key] = value
+            changed.append(key)
+    return changed
 
 
 def _write_csv_row(csv_path: Path, row: dict[str, float | int]) -> None:
@@ -1417,11 +1699,22 @@ def _evaluate(
     dummy_image_size: int,
     episodes: int,
     device: str,
+    video_dir: Path | None = None,
+    video_fps: int = 20,
+    video_render_size: int = 256,
+    video_max_episodes: int = 0,
+    video_tag: str = "",
+    video_phase: str = "online",
+    step: int = 0,
+    online_episode_idx: int = -1,
 ) -> dict[str, float]:
     returns = []
     successes = []
+    saved_videos = 0
 
-    for _ in range(episodes):
+    for eval_ep_idx in range(episodes):
+        capture_video = video_dir is not None and eval_ep_idx < max(int(video_max_episodes), 0)
+        frames: list[np.ndarray] = []
         ts = eval_env.reset()
         obs = ts.observation
         eval_base.reset_episode()
@@ -1429,6 +1722,13 @@ def _evaluate(
         done = False
         ep_ret = 0.0
         success = 0.0
+
+        if capture_video:
+            try:
+                frames.append(_capture_frame(eval_env, render_size=int(video_render_size)))
+            except Exception as exc:
+                print(f"[eval-video] capture disabled (init): {exc}")
+                capture_video = False
 
         while not done:
             base_action_dict = eval_base.act(obs, step_in_ep, step_in_ep)
@@ -1463,6 +1763,35 @@ def _evaluate(
             ep_ret += float(ts.reward)
             success = 1.0 if bool(obs.get("goal_achieved", False)) else success
             step_in_ep += 1
+            if capture_video:
+                try:
+                    frames.append(_capture_frame(eval_env, render_size=int(video_render_size)))
+                except Exception as exc:
+                    print(f"[eval-video] capture disabled (step): {exc}")
+                    capture_video = False
+
+        if capture_video and frames:
+            tag = _slugify(video_tag)
+            phase = _slugify(video_phase) or "online"
+            status = "success" if int(success) > 0 else "fail"
+            name_parts = [
+                phase,
+                f"step{int(step):07d}",
+                f"train_ep{int(online_episode_idx):06d}" if int(online_episode_idx) >= 0 else "train_epNA",
+                f"eval_ep{int(eval_ep_idx):02d}",
+                status,
+            ]
+            if tag:
+                name_parts.insert(0, tag)
+            video_path = _dedup_path(video_dir / ("__".join(name_parts) + ".mp4"))
+            try:
+                if imageio is None:
+                    raise RuntimeError("imageio is not available")
+                imageio.mimsave(str(video_path), frames, fps=max(1, int(video_fps)))
+                saved_videos += 1
+                print(f"[eval-video] saved: {video_path}")
+            except Exception as exc:
+                print(f"[eval-video] save failed: {exc}")
 
         returns.append(ep_ret)
         successes.append(success)
@@ -1470,11 +1799,138 @@ def _evaluate(
     return {
         "eval/episode_return": float(np.mean(returns)) if returns else 0.0,
         "eval/success": float(np.mean(successes)) if successes else 0.0,
+        "eval/videos_saved": int(saved_videos),
     }
+
+
+def _collect_offline_transitions_from_base_rollout(
+    *,
+    env,
+    base: FrozenPointPolicyBaseRL,
+    pixel_key: str,
+    include_eef_pos: bool,
+    low: np.ndarray,
+    high: np.ndarray,
+    target_episodes: int,
+    success_only: bool,
+    terminal_reward: float,
+    step_reward: float,
+    max_episode_len: int,
+    max_attempt_mult: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    target_episodes = max(1, int(target_episodes))
+    max_attempts = max(target_episodes * max(1, int(max_attempt_mult)), target_episodes)
+
+    transitions: list[dict[str, Any]] = []
+    accepted_episodes = 0
+    success_episodes = 0
+    attempted_episodes = 0
+
+    while accepted_episodes < target_episodes and attempted_episodes < max_attempts:
+        ts = env.reset()
+        obs = ts.observation
+        base.reset_episode()
+        step_in_ep = 0
+        episode_transitions: list[dict[str, Any]] = []
+        episode_success = False
+        done = False
+
+        base_action_dict = base.act(obs, step_in_ep, step_in_ep)
+        while not done and step_in_ep < int(max_episode_len):
+            base_action_raw = np.asarray(env.point2action(base_action_dict), dtype=np.float32).reshape(7)
+            state_vec = observation_to_state(
+                obs=obs,
+                pixel_key=pixel_key,
+                base_action_7d=base_action_raw,
+                include_eef_pos=include_eef_pos,
+            )
+
+            forced_terminal_due_env_error = False
+            try:
+                ts_next = env.step(clip_action(base_action_raw, low=low, high=high))
+                next_obs = ts_next.observation
+                done = bool(ts_next.last())
+            except ValueError as exc:
+                if "terminated episode" not in str(exc):
+                    raise
+                forced_terminal_due_env_error = True
+                next_obs = obs
+                done = True
+                print(f"[offline-rollout] forced terminal transition due to env step error: {exc}")
+
+            goal_achieved = bool(next_obs.get("goal_achieved", False))
+            episode_success = episode_success or goal_achieved
+            reward = float(terminal_reward if (done and goal_achieved) else step_reward)
+
+            if done:
+                next_base_action_raw = np.zeros((7,), dtype=np.float32)
+                next_base_action_dict = None
+            else:
+                next_base_action_dict = base.act(next_obs, step_in_ep + 1, step_in_ep + 1)
+                next_base_action_raw = np.asarray(
+                    env.point2action(next_base_action_dict), dtype=np.float32
+                ).reshape(7)
+
+            next_state_vec = observation_to_state(
+                obs=next_obs,
+                pixel_key=pixel_key,
+                base_action_7d=next_base_action_raw,
+                include_eef_pos=include_eef_pos,
+            )
+            episode_transitions.append(
+                {
+                    "obs": state_vec,
+                    "action": base_action_raw.copy(),
+                    "reward": reward,
+                    "next_obs": next_state_vec,
+                    "done": bool(done),
+                    "base_action": base_action_raw.copy(),
+                    "next_base_action": next_base_action_raw.copy(),
+                }
+            )
+
+            if done:
+                break
+            obs = next_obs
+            base_action_dict = next_base_action_dict
+            step_in_ep += 1
+            if forced_terminal_due_env_error:
+                break
+
+        attempted_episodes += 1
+        keep_episode = episode_success if success_only else True
+        if keep_episode and episode_transitions:
+            transitions.extend(episode_transitions)
+            accepted_episodes += 1
+            if episode_success:
+                success_episodes += 1
+        if attempted_episodes % 10 == 0 or accepted_episodes == target_episodes:
+            print(
+                "[offline-rollout] progress "
+                f"accepted={accepted_episodes}/{target_episodes} "
+                f"attempted={attempted_episodes}/{max_attempts} "
+                f"success_eps={success_episodes}"
+            )
+
+    stats = {
+        "attempted_episodes": int(attempted_episodes),
+        "accepted_episodes": int(accepted_episodes),
+        "success_episodes": int(success_episodes),
+        "target_episodes": int(target_episodes),
+        "max_attempts": int(max_attempts),
+        "transitions": int(len(transitions)),
+    }
+    if accepted_episodes < target_episodes:
+        print(
+            "[offline-rollout] warning: collected fewer episodes than requested "
+            f"(accepted={accepted_episodes}, target={target_episodes})."
+        )
+    return transitions, stats
 
 
 def main() -> None:
     args = parse_args()
+    _assert_strict_resfit_args(args)
     repo_root = Path(__file__).resolve().parents[1]
     output_root = (repo_root / args.output_root).resolve()
     device = coerce_device(args.device)
@@ -1527,6 +1983,57 @@ def main() -> None:
         bc_weight=Path(args.bc_weight),
         device=device,
     )
+
+    suite_override_name = str(args.suite or "").strip()
+    if _is_basefix_v1_suite_name(suite_override_name):
+        changed_total: set[str] = set()
+        for base_cfg in (train_base.cfg, eval_base.cfg):
+            if isinstance(base_cfg, dict):
+                changed_total.update(_apply_basefix_v1_suite_preset(base_cfg, suite_override_name))
+        changed_keys = ",".join(sorted(changed_total)) if changed_total else "none"
+        print(
+            "[suite-override] applied basefix_v1 preset "
+            f"suite={suite_override_name} changed={changed_keys}"
+        )
+
+    if args.suite_gripper_close_position_gate.strip() != "":
+        gate_value = _parse_bool_text(args.suite_gripper_close_position_gate)
+        for base_cfg in (train_base.cfg, eval_base.cfg):
+            if isinstance(base_cfg, dict):
+                suite_cfg = base_cfg.get("suite")
+                if isinstance(suite_cfg, dict):
+                    suite_cfg["gripper_close_position_gate"] = gate_value
+        print(f"[suite-override] gripper_close_position_gate={gate_value}")
+    if args.suite_gripper_cmd_slew_rate is not None:
+        slew_value = float(args.suite_gripper_cmd_slew_rate)
+        for base_cfg in (train_base.cfg, eval_base.cfg):
+            if isinstance(base_cfg, dict):
+                suite_cfg = base_cfg.get("suite")
+                if isinstance(suite_cfg, dict):
+                    suite_cfg["gripper_cmd_slew_rate"] = slew_value
+        print(f"[suite-override] gripper_cmd_slew_rate={slew_value}")
+
+    benchmark_override = str(args.benchmark_name).strip()
+    task_order_override = int(args.task_order_index)
+    if benchmark_override or task_order_override >= 0:
+        for base_cfg in (train_base.cfg, eval_base.cfg):
+            if not isinstance(base_cfg, dict):
+                continue
+            suite_cfg = base_cfg.get("suite")
+            if not isinstance(suite_cfg, dict):
+                continue
+            task_cfg = suite_cfg.get("task")
+            if not isinstance(task_cfg, dict):
+                task_cfg = {}
+                suite_cfg["task"] = task_cfg
+            if benchmark_override:
+                task_cfg["benchmark_name"] = benchmark_override
+            if task_order_override >= 0:
+                task_cfg["task_order_index"] = int(task_order_override)
+        if benchmark_override:
+            print(f"[suite-override] benchmark_name={benchmark_override}")
+        if task_order_override >= 0:
+            print(f"[suite-override] task_order_index={task_order_override}")
 
     cfg_suite = train_base.cfg.get("suite", {}) if isinstance(train_base.cfg, dict) else {}
     cfg_task = cfg_suite.get("task", {}) if isinstance(cfg_suite, dict) else {}
@@ -1666,52 +2173,108 @@ def main() -> None:
 
     offline_rb = None
     offline_transition_count = 0
-    if args.offline_demo_root.strip():
-        offline_demo_root = Path(args.offline_demo_root).expanduser().resolve()
-    else:
-        offline_demo_root = (repo_root / "expert_demos" / suite_name).resolve()
+    offline_source = str(args.offline_source).strip().lower()
+    offline_demo_root: Path | None = None
+    offline_rollout_stats: dict[str, int] = {}
 
     if offline_fraction > 0.0:
-        max_demos = args.offline_max_demos if args.offline_max_demos > 0 else None
-        bc_action_fn = None
-        bc_reset_episode_fn = None
-        if args.offline_base_action_mode == "bc_track_delta":
-            offline_base = FrozenPointPolicyBaseRL(
+        if offline_source == "base_rollout":
+            target_rollout_episodes = int(args.offline_rollout_episodes)
+            if target_rollout_episodes <= 0:
+                target_rollout_episodes = int(args.offline_max_demos)
+            if target_rollout_episodes <= 0:
+                target_rollout_episodes = 50
+
+            collect_env, _, collect_pixel_key, _, _, _ = build_single_env_from_bc_config(
+                cfg=train_base.cfg,
+                repo_root=repo_root,
+                suite_override=args.suite,
+                task_override=args.task_name,
+                seed=args.seed + 777,
+                eval_mode=False,
+                max_episode_len=args.env_max_episode_len,
+            )
+            if str(collect_pixel_key) != str(pixel_key):
+                print(
+                    "[offline-rollout] pixel key mismatch "
+                    f"train={pixel_key} collect={collect_pixel_key}; using collect key"
+                )
+
+            collect_base = FrozenPointPolicyBaseRL(
                 repo_root=repo_root,
                 bc_weight=Path(args.bc_weight),
                 device=device,
             )
-            offline_base.build(
-                obs_spec=train_env.observation_spec(),
-                action_spec=train_env.action_spec(),
+            collect_base.build(
+                obs_spec=collect_env.observation_spec(),
+                action_spec=collect_env.action_spec(),
                 max_episode_len=args.env_max_episode_len,
             )
+            offline_transitions, offline_rollout_stats = _collect_offline_transitions_from_base_rollout(
+                env=collect_env,
+                base=collect_base,
+                pixel_key=collect_pixel_key,
+                include_eef_pos=args.include_eef_pos,
+                low=low,
+                high=high,
+                target_episodes=target_rollout_episodes,
+                success_only=bool(args.offline_success_only),
+                terminal_reward=float(args.offline_terminal_reward),
+                step_reward=float(args.offline_step_reward),
+                max_episode_len=int(args.env_max_episode_len),
+                max_attempt_mult=int(args.offline_rollout_max_attempt_mult),
+            )
+            try:
+                if hasattr(collect_env, "close"):
+                    collect_env.close()
+            except Exception:
+                pass
+        else:
+            if args.offline_demo_root.strip():
+                offline_demo_root = Path(args.offline_demo_root).expanduser().resolve()
+            else:
+                offline_demo_root = (repo_root / "expert_demos" / suite_name).resolve()
 
-            def _bc_reset_episode() -> None:
-                offline_base.reset_episode()
+            max_demos = args.offline_max_demos if args.offline_max_demos > 0 else None
+            bc_action_fn = None
+            bc_reset_episode_fn = None
+            if args.offline_base_action_mode == "bc_track_delta":
+                offline_base = FrozenPointPolicyBaseRL(
+                    repo_root=repo_root,
+                    bc_weight=Path(args.bc_weight),
+                    device=device,
+                )
+                offline_base.build(
+                    obs_spec=train_env.observation_spec(),
+                    action_spec=train_env.action_spec(),
+                    max_episode_len=args.env_max_episode_len,
+                )
 
-            def _bc_action(obs_step: dict[str, Any], step_idx: int) -> dict[str, Any]:
-                return offline_base.act(obs_step, step_idx, step_idx)
+                def _bc_reset_episode() -> None:
+                    offline_base.reset_episode()
 
-            bc_action_fn = _bc_action
-            bc_reset_episode_fn = _bc_reset_episode
+                def _bc_action(obs_step: dict[str, Any], step_idx: int) -> dict[str, Any]:
+                    return offline_base.act(obs_step, step_idx, step_idx)
 
-        offline_transitions = build_offline_transitions_from_expert_demos_rl(
-            demo_root=offline_demo_root,
-            suite_name=suite_name,
-            task_name=task_name,
-            pixel_key=pixel_key,
-            include_eef_pos=args.include_eef_pos,
-            low=low,
-            high=high,
-            max_demos=max_demos,
-            terminal_reward=args.offline_terminal_reward,
-            step_reward=args.offline_step_reward,
-            base_action_mode=args.offline_base_action_mode,
-            transition_action_mode="combined_base",
-            bc_action_fn=bc_action_fn,
-            bc_reset_episode_fn=bc_reset_episode_fn,
-        )
+                bc_action_fn = _bc_action
+                bc_reset_episode_fn = _bc_reset_episode
+
+            offline_transitions = build_offline_transitions_from_expert_demos_rl(
+                demo_root=offline_demo_root,
+                suite_name=suite_name,
+                task_name=task_name,
+                pixel_key=pixel_key,
+                include_eef_pos=args.include_eef_pos,
+                low=low,
+                high=high,
+                max_demos=max_demos,
+                terminal_reward=args.offline_terminal_reward,
+                step_reward=args.offline_step_reward,
+                base_action_mode=args.offline_base_action_mode,
+                transition_action_mode="combined_base",
+                bc_action_fn=bc_action_fn,
+                bc_reset_episode_fn=bc_reset_episode_fn,
+            )
 
         if offline_transitions:
             offline_rb = _build_replay_buffer(
@@ -1736,6 +2299,18 @@ def main() -> None:
             offline_batch_size = 0
             online_batch_size = int(args.batch_size)
 
+    if bool(args.strict_resfit):
+        if offline_fraction <= 0.0 or offline_rb is None or len(offline_rb) <= 0:
+            raise ValueError(
+                "[strict-resfit] offline buffer is empty after initialization; "
+                "strict mode requires effective offline_fraction > 0 with valid offline transitions."
+            )
+        if abs(float(offline_fraction) - 0.5) > 1e-12:
+            raise ValueError(
+                "[strict-resfit] effective offline_fraction drifted from 0.5 "
+                f"(effective={offline_fraction})"
+            )
+
     run_meta = {
         "backend": "resfit_qagent",
         "resfit_root": str(resfit_root),
@@ -1750,11 +2325,14 @@ def main() -> None:
         "offline": {
             "fraction_requested": requested_offline_fraction,
             "fraction_applied": offline_fraction,
-            "demo_root": str(offline_demo_root),
+            "source": offline_source,
+            "demo_root": str(offline_demo_root) if offline_demo_root is not None else "",
             "base_action_mode": args.offline_base_action_mode,
             "transitions": int(offline_transition_count),
             "offline_batch_size": int(offline_batch_size),
             "online_batch_size": int(online_batch_size),
+            "success_only": bool(args.offline_success_only),
+            "rollout_stats": offline_rollout_stats,
         },
         "replay": {
             "sampling_strategy_requested": requested_sampling_strategy,
@@ -1779,11 +2357,74 @@ def main() -> None:
 
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
+    eval_video_enabled = bool(args.eval_save_video)
+    eval_video_dir: Path | None = None
+    eval_video_every_ep = max(1, int(args.eval_video_online_every_episodes))
+    last_online_video_episode = -1
+    if eval_video_enabled:
+        if imageio is None:
+            print("[eval-video] disabled because imageio is not available")
+            eval_video_enabled = False
+        else:
+            if str(args.eval_video_dir).strip():
+                eval_video_dir = Path(args.eval_video_dir).expanduser().resolve()
+            else:
+                eval_video_dir = (run_dir / "eval_videos_rl").resolve()
+            eval_video_dir.mkdir(parents=True, exist_ok=True)
+            print(
+                "[eval-video] enabled "
+                f"dir={eval_video_dir} fps={int(args.eval_video_fps)} "
+                f"render_size={int(args.eval_video_render_size)} "
+                f"online_every_episodes={eval_video_every_ep}"
+            )
+
     episode_return = 0.0
     episode_len = 0
     episode_idx = 0
     success_flag = 0
     cached_base_action_dict = base_action_dict
+    diag_sums = {
+        "clip_rate_dim": 0.0,
+        "clip_any": 0.0,
+        "residual_induced_clip_rate_dim": 0.0,
+        "base_norm_l2": 0.0,
+        "residual_norm_l2": 0.0,
+        "res_over_base": 0.0,
+        "clip_delta_l1_mean": 0.0,
+        "clip_delta_linf": 0.0,
+        "exec_clip_raw_delta": 0.0,
+    }
+    diag_exec_clip_raw_delta_max = 0.0
+    diag_count = 0
+
+    # Offline phase preview: save exactly one eval video before online rollout starts.
+    if eval_video_enabled and eval_video_dir is not None:
+        offline_eval_metrics = _evaluate(
+            eval_env=eval_env,
+            eval_base=eval_base,
+            q_agent=q_agent,
+            resfit_utils=resfit_utils,
+            action_normalizer=action_normalizer,
+            pixel_key=pixel_key,
+            include_eef_pos=args.include_eef_pos,
+            camera_key=args.camera_key,
+            dummy_image_size=args.dummy_image_size,
+            episodes=int(args.eval_episodes),
+            device=device,
+            video_dir=eval_video_dir,
+            video_fps=int(args.eval_video_fps),
+            video_render_size=int(args.eval_video_render_size),
+            video_max_episodes=1,
+            video_tag=args.eval_video_tag,
+            video_phase="offline",
+            step=0,
+            online_episode_idx=-1,
+        )
+        offline_eval_row = {"step": 0, **offline_eval_metrics}
+        _write_csv_row(eval_csv, offline_eval_row)
+        print(json.dumps(offline_eval_row))
+        if wandb_mod is not None:
+            wandb_mod.log({k: v for k, v in offline_eval_row.items() if k != "step"}, step=0)
 
     for global_step in range(1, int(args.steps) + 1):
         base_action_dict = cached_base_action_dict
@@ -1821,9 +2462,19 @@ def main() -> None:
 
         combined_norm = np.clip(base_action_norm + residual_norm, -1.0, 1.0).astype(np.float32)
         env_action_raw = action_normalizer.denormalize(combined_norm)
+        action_diag = _action_diag(base_action_norm, residual_norm)
+        env_action_exec = clip_action(env_action_raw, low=low, high=high)
+        exec_clip_raw_delta = float(np.max(np.abs(env_action_exec - env_action_raw)))
+        action_diag["exec_clip_raw_delta"] = exec_clip_raw_delta
+        for _k, _v in action_diag.items():
+            if _k in diag_sums:
+                diag_sums[_k] += float(_v)
+        diag_exec_clip_raw_delta_max = max(diag_exec_clip_raw_delta_max, exec_clip_raw_delta)
+        diag_count += 1
+
         forced_terminal_due_env_error = False
         try:
-            ts_next = train_env.step(clip_action(env_action_raw, low=low, high=high))
+            ts_next = train_env.step(env_action_exec)
             next_obs = ts_next.observation
             done = bool(ts_next.last())
         except ValueError as exc:
@@ -1868,7 +2519,7 @@ def main() -> None:
             online_rb,
             state_vec=state_vec,
             next_state_vec=next_state_vec,
-            combined_action_raw=env_action_raw,
+            combined_action_raw=env_action_exec,
             reward=reward,
             done=done,
             action_normalizer=action_normalizer,
@@ -1898,6 +2549,20 @@ def main() -> None:
                 if batch is None:
                     break
 
+                if bool(args.strict_resfit):
+                    _assert_tensor_range(
+                        _get_batch_tensor(batch, ("action",)),
+                        lo=-1.01,
+                        hi=1.01,
+                        name="batch.action(norm)",
+                    )
+                    _assert_tensor_range(
+                        _get_batch_tensor(batch, ("obs", "observation.base_action")),
+                        lo=-1.01,
+                        hi=1.01,
+                        name="batch.obs.observation.base_action(norm)",
+                    )
+
                 update_actor = ((i + 1) % actor_update_cadence) == 0
                 metrics = q_agent.update(
                     batch=batch,
@@ -1922,6 +2587,7 @@ def main() -> None:
                 num_updates_done += 1
 
         if global_step % int(args.log_every) == 0:
+            diag_den = max(diag_count, 1)
             row = {
                 "step": global_step,
                 "online_buffer_size": len(online_rb),
@@ -1936,13 +2602,39 @@ def main() -> None:
                 "critic_loss": float(metrics.get("train/critic_loss", 0.0)),
                 "actor_loss": float(metrics.get("train/actor_loss_total", 0.0)),
                 "batch_reward": float(metrics.get("data/batch_R", 0.0)),
+                "diag_samples": int(diag_count),
+                "diag_clip_rate_dim": float(diag_sums["clip_rate_dim"] / diag_den),
+                "diag_clip_any_rate": float(diag_sums["clip_any"] / diag_den),
+                "diag_residual_induced_clip_rate_dim": float(
+                    diag_sums["residual_induced_clip_rate_dim"] / diag_den
+                ),
+                "diag_base_norm_l2": float(diag_sums["base_norm_l2"] / diag_den),
+                "diag_residual_norm_l2": float(diag_sums["residual_norm_l2"] / diag_den),
+                "diag_res_over_base": float(diag_sums["res_over_base"] / diag_den),
+                "diag_clip_delta_l1_mean": float(diag_sums["clip_delta_l1_mean"] / diag_den),
+                "diag_clip_delta_linf": float(diag_sums["clip_delta_linf"] / diag_den),
+                "diag_exec_clip_raw_delta_mean": float(diag_sums["exec_clip_raw_delta"] / diag_den),
+                "diag_exec_clip_raw_delta_max": float(diag_exec_clip_raw_delta_max),
             }
             _write_csv_row(train_csv, row)
             print(json.dumps(row))
             if wandb_mod is not None:
                 wandb_mod.log({f"train/{k}": v for k, v in row.items() if k != "step"}, step=global_step)
+            for _k in diag_sums.keys():
+                diag_sums[_k] = 0.0
+            diag_exec_clip_raw_delta_max = 0.0
+            diag_count = 0
 
         if int(args.eval_every) > 0 and global_step % int(args.eval_every) == 0:
+            capture_online_video = False
+            if eval_video_enabled and eval_video_dir is not None:
+                if episode_idx == 0 and last_online_video_episode < 0:
+                    capture_online_video = True
+                elif episode_idx > 0 and episode_idx % eval_video_every_ep == 0 and episode_idx != last_online_video_episode:
+                    capture_online_video = True
+                if capture_online_video:
+                    last_online_video_episode = int(episode_idx)
+
             eval_metrics = _evaluate(
                 eval_env=eval_env,
                 eval_base=eval_base,
@@ -1955,6 +2647,14 @@ def main() -> None:
                 dummy_image_size=args.dummy_image_size,
                 episodes=int(args.eval_episodes),
                 device=device,
+                video_dir=eval_video_dir if capture_online_video else None,
+                video_fps=int(args.eval_video_fps),
+                video_render_size=int(args.eval_video_render_size),
+                video_max_episodes=max(1, int(args.eval_video_max_episodes)) if capture_online_video else 0,
+                video_tag=args.eval_video_tag,
+                video_phase="online",
+                step=int(global_step),
+                online_episode_idx=int(episode_idx),
             )
             eval_row = {"step": global_step, **eval_metrics}
             _write_csv_row(eval_csv, eval_row)

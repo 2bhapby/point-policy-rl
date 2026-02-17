@@ -31,8 +31,12 @@ from point_policy_rl.env_bridge_rl import (
 from point_policy_rl.td3_agent_rl import ResidualTD3AgentRL, TD3ConfigRL
 from point_policy_rl.train_resfit_residual_td3_rl import (
     LinearActionNormalizerRL,
+    _apply_basefix_v1_suite_preset,
     _build_resfit_qagent,
     _ensure_resfit_common_utils_compat,
+    _ensure_tabulate_compat,
+    _ensure_torch_attention_compat,
+    _is_basefix_v1_suite_name,
     _state_to_agent_obs_batched,
 )
 from point_policy_rl.utils_rl import coerce_device, set_seed
@@ -49,9 +53,19 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="/sjw_alinlab2/home/sanghyeok/residual-offpolicy-rl",
     )
-    parser.add_argument("--suite", type=str, default=None, choices=["libero_spatial", "libero_object"])
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default=None,
+        choices=[
+            "libero_spatial",
+            "libero_object",
+            "libero_spatial_basefix_v1",
+            "libero_object_basefix_v1",
+        ],
+    )
     parser.add_argument("--task-name", type=str, default=None)
-    parser.add_argument("--env-max-episode-len", type=int, default=300)
+    parser.add_argument("--env-max-episode-len", type=int, default=3000)
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--video-dir", type=str, default=None)
     parser.add_argument("--video-fps", type=int, default=20)
@@ -183,6 +197,8 @@ def _dedup_path(path: Path) -> Path:
 
 def main() -> None:
     args = parse_args()
+    _ensure_torch_attention_compat()
+    _ensure_tabulate_compat()
     device = coerce_device(args.device)
     set_seed(args.seed)
 
@@ -196,6 +212,16 @@ def main() -> None:
     ckpt_format = "resfit_agent" if "agent" in payload else "td3_legacy"
     if ckpt_format == "td3_legacy" and "td3" not in payload:
         raise KeyError("Unsupported checkpoint format: expected 'td3' or 'agent' key")
+
+    # ResFiT checkpoints need the external resfit package root on sys.path.
+    if ckpt_format == "resfit_agent":
+        resfit_root = Path(args.resfit_root).expanduser().resolve()
+        if not (resfit_root / "resfit").exists():
+            raise FileNotFoundError(
+                f"Invalid resfit root (missing 'resfit/' package): {resfit_root}"
+            )
+        if str(resfit_root) not in sys.path:
+            sys.path.insert(0, str(resfit_root))
 
     bc_weight = _resolve_bc_weight(payload)
 
@@ -213,6 +239,13 @@ def main() -> None:
 
     suite_override = args.suite or payload.get("suite") or payload_args.get("suite")
     task_override = args.task_name or payload.get("task_name") or payload_args.get("task_name")
+    if _is_basefix_v1_suite_name(suite_override) and isinstance(base.cfg, dict):
+        changed = _apply_basefix_v1_suite_preset(base.cfg, suite_override)
+        changed_keys = ",".join(sorted(changed)) if changed else "none"
+        print(
+            "[suite-override] applied basefix_v1 preset "
+            f"suite={suite_override} changed={changed_keys}"
+        )
 
     env, _, pixel_key, low_default, high_default, _ = build_single_env_from_bc_config(
         cfg=base.cfg,
@@ -277,6 +310,7 @@ def main() -> None:
         td3.load_state_dict(td3_payload)
     else:
         q_args = _build_resfit_args_for_eval(payload=payload, cli_resfit_root=args.resfit_root)
+        resfit_utils = _ensure_resfit_common_utils_compat(Path(q_args.resfit_root).expanduser().resolve())
         q_agent = _build_resfit_qagent(
             args=q_args,
             device=device,
@@ -284,7 +318,6 @@ def main() -> None:
             prop_dim=int(state0.shape[0] - 7),
         )
         q_agent.load_state_dict(payload["agent"])
-        resfit_utils = _ensure_resfit_common_utils_compat(Path(q_args.resfit_root).expanduser().resolve())
         normalizer_payload = payload.get("action_normalizer", {})
         if not isinstance(normalizer_payload, dict):
             normalizer_payload = {}

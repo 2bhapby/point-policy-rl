@@ -20,6 +20,7 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 WANDB_ENABLE="${WANDB_ENABLE:-0}"
 WANDB_PROJECT="${WANDB_PROJECT:-point-policy-residual-rl}"
 WANDB_MODE="${WANDB_MODE:-online}"
+ENV_MAX_EPISODE_LEN="${ENV_MAX_EPISODE_LEN:-3000}"
 
 if [[ -z "${BC_WEIGHT}" ]]; then
   echo "BC_WEIGHT is required"
@@ -39,6 +40,7 @@ python point_policy_rl/train_resfit_residual_td3_rl.py \
   --bc-weight "${BC_WEIGHT}" \
   --suite libero_spatial \
   --task-name "${TASK_NAME}" \
+  --env-max-episode-len "${ENV_MAX_EPISODE_LEN}" \
   --resfit-root "${RESFIT_ROOT}" \
   --run-name "${RUN_NAME}" \
   --output-root point_policy/exp_local_rl \

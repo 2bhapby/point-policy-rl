@@ -21,3 +21,10 @@ use_object_points: ${suite.use_object_points}
 num_object_points: ${suite.num_object_points}
 point_dim: ${suite.point_dim}
 pred_gripper: true
+gripper_loss_weight: 20.0
+gripper_agg_mode: avg
+condition_on_gripper_state: true
+separate_gripper_head: false
+gripper_bce_weight: 1.0
+gripper_label_mode: ${suite.gripper_label_mode}
+gripper_head_use_transformer_context: false

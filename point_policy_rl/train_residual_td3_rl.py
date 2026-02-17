@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=200)
 
     parser.add_argument("--include-eef-pos", action="store_true")
-    parser.add_argument("--env-max-episode-len", type=int, default=300)
+    parser.add_argument("--env-max-episode-len", type=int, default=3000)
 
     parser.add_argument("--offline-fraction", type=float, default=0.0)
     parser.add_argument("--offline-demo-root", type=str, default="")
