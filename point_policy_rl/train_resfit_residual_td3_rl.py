@@ -98,6 +98,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-action-noise-scale", type=float, default=1.0)
 
     parser.add_argument("--residual-action-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--residual-gripper-mode",
+        type=str,
+        default="full",
+        choices=["full", "zero", "scale"],
+        help="How to apply residual on gripper dim (index 6): full/zero/scale.",
+    )
+    parser.add_argument(
+        "--residual-gripper-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for residual gripper when --residual-gripper-mode=scale.",
+    )
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--critic-target-tau", type=float, default=0.005)
@@ -292,6 +305,24 @@ def _action_diag(base_norm: np.ndarray, residual_norm: np.ndarray) -> dict[str, 
         "clip_delta_l1_mean": float(np.abs(pre - post).mean()),
         "clip_delta_linf": float(np.max(np.abs(pre - post))),
     }
+
+
+def _apply_residual_gripper_mode(
+    residual_norm: np.ndarray,
+    *,
+    mode: str,
+    scale: float,
+) -> np.ndarray:
+    out = np.asarray(residual_norm, dtype=np.float32).reshape(-1).copy()
+    if out.size < 7:
+        return out.astype(np.float32)
+
+    mode_norm = str(mode).strip().lower()
+    if mode_norm == "zero":
+        out[6] = 0.0
+    elif mode_norm == "scale":
+        out[6] = float(out[6] * float(scale))
+    return out.astype(np.float32)
 
 
 def _get_batch_tensor(batch, keys: tuple[str, ...]):
@@ -1707,6 +1738,8 @@ def _evaluate(
     video_phase: str = "online",
     step: int = 0,
     online_episode_idx: int = -1,
+    residual_gripper_mode: str = "full",
+    residual_gripper_scale: float = 1.0,
 ) -> dict[str, float]:
     returns = []
     successes = []
@@ -1753,6 +1786,11 @@ def _evaluate(
                     .numpy()
                     .astype(np.float32)
                 )
+            residual_norm = _apply_residual_gripper_mode(
+                residual_norm,
+                mode=residual_gripper_mode,
+                scale=float(residual_gripper_scale),
+            )
 
             base_norm = action_normalizer.normalize(base_action_raw)
             combined_norm = np.clip(base_norm + residual_norm, -1.0, 1.0).astype(np.float32)
@@ -2419,6 +2457,8 @@ def main() -> None:
             video_phase="offline",
             step=0,
             online_episode_idx=-1,
+            residual_gripper_mode=args.residual_gripper_mode,
+            residual_gripper_scale=float(args.residual_gripper_scale),
         )
         offline_eval_row = {"step": 0, **offline_eval_metrics}
         _write_csv_row(eval_csv, offline_eval_row)
@@ -2459,6 +2499,11 @@ def main() -> None:
                     .numpy()
                     .astype(np.float32)
                 )
+        residual_norm = _apply_residual_gripper_mode(
+            residual_norm,
+            mode=args.residual_gripper_mode,
+            scale=float(args.residual_gripper_scale),
+        )
 
         combined_norm = np.clip(base_action_norm + residual_norm, -1.0, 1.0).astype(np.float32)
         env_action_raw = action_normalizer.denormalize(combined_norm)
@@ -2655,6 +2700,8 @@ def main() -> None:
                 video_phase="online",
                 step=int(global_step),
                 online_episode_idx=int(episode_idx),
+                residual_gripper_mode=args.residual_gripper_mode,
+                residual_gripper_scale=float(args.residual_gripper_scale),
             )
             eval_row = {"step": global_step, **eval_metrics}
             _write_csv_row(eval_csv, eval_row)
