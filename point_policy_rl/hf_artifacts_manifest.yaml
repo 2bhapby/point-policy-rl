@@ -1,0 +1,118 @@
+version: 1
+description: "Point-Policy RL reusable artifacts (BC checkpoints, offline datasets, residual checkpoints)"
+
+variables:
+  HF_NAMESPACE: "insagur"
+
+artifacts:
+  # ----------------------------
+  # BC checkpoints (base policy)
+  # ----------------------------
+  - name: "bc_libero10_scene3_basefix_v1_step100k"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local/2026.02.17/point_policy_libero_object_basefix_v1_lib10_scene3_obj15_sephead_nocond_bf1_0217/debug_201911_lib10_scene3_obj15_sephead_nocond_bf1_0217/004042_hidden_dim_256/snapshot/100000.pt"
+    path_in_repo: "bc/libero10/scene3/basefix_v1/100000.pt"
+
+  - name: "bc_libero10_scene6_basefix_v1_step100k"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local/2026.02.17/point_policy_libero_object_basefix_v1_lib10_scene6_obj15_sephead_nocond_bf1_0217/debug_201915_lib10_scene6_obj15_sephead_nocond_bf1_0217/005137_hidden_dim_256/snapshot/100000.pt"
+    path_in_repo: "bc/libero10/scene6/basefix_v1/100000.pt"
+
+  - name: "bc_libero10_scene8_basefix_v1_step100k"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local/2026.02.15/point_policy_libero_object_lib10_scene8_obj15_sephead_nocond_v3_0215_165945/debug_200119_lib10_scene8_obj15_sephead_nocond_v3_0215_165945/170022_hidden_dim_256/snapshot/100000.pt"
+    path_in_repo: "bc/libero10/scene8/basefix_v1/100000.pt"
+
+  # -------------------------
+  # Offline datasets (RLDS)
+  # -------------------------
+  - name: "offline_rlds_scene3_pkl"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
+    repo_type: "dataset"
+    local_path: "point_policy/exp_local/offline_rlds/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it.pkl"
+    path_in_repo: "offline_rlds/libero10/scene3/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it.pkl"
+
+  - name: "offline_rlds_scene3_summary"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
+    repo_type: "dataset"
+    local_path: "point_policy/exp_local/offline_rlds/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it.summary.txt"
+    path_in_repo: "offline_rlds/libero10/scene3/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it.summary.txt"
+
+  - name: "offline_rlds_scene6_pkl"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
+    repo_type: "dataset"
+    local_path: "point_policy/exp_local/offline_rlds/libero10_6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it.pkl"
+    path_in_repo: "offline_rlds/libero10/scene6/libero10_6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it.pkl"
+
+  - name: "offline_rlds_scene6_summary"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
+    repo_type: "dataset"
+    local_path: "point_policy/exp_local/offline_rlds/libero10_6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it.summary.txt"
+    path_in_repo: "offline_rlds/libero10/scene6/libero10_6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it.summary.txt"
+
+  - name: "offline_rlds_scene8_pkl"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
+    repo_type: "dataset"
+    local_path: "point_policy/exp_local/offline_rlds/libero10_8_put_both_moka_pots_on_the_stove.pkl"
+    path_in_repo: "offline_rlds/libero10/scene8/libero10_8_put_both_moka_pots_on_the_stove.pkl"
+
+  - name: "offline_rlds_scene8_summary"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
+    repo_type: "dataset"
+    local_path: "point_policy/exp_local/offline_rlds/libero10_8_put_both_moka_pots_on_the_stove.summary.txt"
+    path_in_repo: "offline_rlds/libero10/scene8/libero10_8_put_both_moka_pots_on_the_stove.summary.txt"
+
+  # ---------------------------------------
+  # Residual checkpoints (image-only runs)
+  # ---------------------------------------
+  - name: "residual_img_scene3_fix0220_step400k"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/123809_resfit_img_scene3_pkl50_fix0220/snapshot/400000.pt"
+    path_in_repo: "residual/libero10/scene3/image_only/123809_resfit_img_scene3_pkl50_fix0220/400000.pt"
+
+  - name: "residual_img_scene3_fix0220_run_meta"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/123809_resfit_img_scene3_pkl50_fix0220/run_meta.json"
+    path_in_repo: "residual/libero10/scene3/image_only/123809_resfit_img_scene3_pkl50_fix0220/run_meta.json"
+
+  - name: "residual_img_scene3_fix0220_train_log"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/123809_resfit_img_scene3_pkl50_fix0220/train_log.csv"
+    path_in_repo: "residual/libero10/scene3/image_only/123809_resfit_img_scene3_pkl50_fix0220/train_log.csv"
+
+  - name: "residual_img_scene3_fix0220_eval_log"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/123809_resfit_img_scene3_pkl50_fix0220/eval_log.csv"
+    path_in_repo: "residual/libero10/scene3/image_only/123809_resfit_img_scene3_pkl50_fix0220/eval_log.csv"
+
+  - name: "residual_img_scene6_fix0220_step400k"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/192600_resfit_img_scene6_pkl50_fix0220/snapshot/400000.pt"
+    path_in_repo: "residual/libero10/scene6/image_only/192600_resfit_img_scene6_pkl50_fix0220/400000.pt"
+
+  - name: "residual_img_scene6_fix0220_run_meta"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/192600_resfit_img_scene6_pkl50_fix0220/run_meta.json"
+    path_in_repo: "residual/libero10/scene6/image_only/192600_resfit_img_scene6_pkl50_fix0220/run_meta.json"
+
+  - name: "residual_img_scene6_fix0220_train_log"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/192600_resfit_img_scene6_pkl50_fix0220/train_log.csv"
+    path_in_repo: "residual/libero10/scene6/image_only/192600_resfit_img_scene6_pkl50_fix0220/train_log.csv"
+
+  - name: "residual_img_scene6_fix0220_eval_log"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-models"
+    repo_type: "model"
+    local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/192600_resfit_img_scene6_pkl50_fix0220/eval_log.csv"
+    path_in_repo: "residual/libero10/scene6/image_only/192600_resfit_img_scene6_pkl50_fix0220/eval_log.csv"
+
