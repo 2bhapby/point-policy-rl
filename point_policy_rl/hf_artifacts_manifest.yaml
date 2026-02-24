@@ -41,6 +41,18 @@ artifacts:
     local_path: "point_policy/exp_local/offline_rlds/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it.summary.txt"
     path_in_repo: "offline_rlds/libero10/scene3/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it.summary.txt"
 
+  - name: "offline_rlds_scene3_img50_pkl"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
+    repo_type: "dataset"
+    local_path: "point_policy/exp_local/offline_rlds/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it_img50.pkl"
+    path_in_repo: "offline_rlds/libero10/scene3/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it_img50.pkl"
+
+  - name: "offline_rlds_scene3_img50_summary"
+    repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
+    repo_type: "dataset"
+    local_path: "point_policy/exp_local/offline_rlds/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it_img50.summary.txt"
+    path_in_repo: "offline_rlds/libero10/scene3/libero10_3_turn_on_the_stove_and_put_the_moka_pot_on_it_img50.summary.txt"
+
   - name: "offline_rlds_scene6_pkl"
     repo_id: "${HF_NAMESPACE}/point-policy-rl-datasets"
     repo_type: "dataset"
@@ -115,4 +127,3 @@ artifacts:
     repo_type: "model"
     local_path: "point_policy/exp_local_rl_rel/2026.02.20/residual_td3_libero_object_basefix_v1_rl/192600_resfit_img_scene6_pkl50_fix0220/eval_log.csv"
     path_in_repo: "residual/libero10/scene6/image_only/192600_resfit_img_scene6_pkl50_fix0220/eval_log.csv"
-
