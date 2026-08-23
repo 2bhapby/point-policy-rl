@@ -15,6 +15,7 @@ try:
 except ModuleNotFoundError:
     from suite.dm_env_compat import dm_env, StepType, TimeStep, specs
 
+from robot_utils.franka.gripper_points import Tshift, extrapoints
 from robot_utils.franka.utils import rigid_transform_3D
 
 _LIBERO_IMPORT_ERROR = None
@@ -271,6 +272,21 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         self._close_approach_offset = float(close_approach_offset)
         self._close_approach_steps = max(0, int(close_approach_steps))
         self._close_approach_remaining = 0
+
+        # Canonical Franka point layout for runtime fallback when kp sites are missing.
+        self._robot_Tshift = np.asarray(Tshift, dtype=np.float32)
+        self._robot_extrapoints = [np.asarray(tp, dtype=np.float32) for tp in extrapoints]
+        self._robot_local_points_open = self._build_default_robot_local_points()
+        self._robot_tip_mid_local = 0.5 * (
+            self._robot_local_points_open[1] + self._robot_local_points_open[2]
+        )
+        tip_delta = self._robot_local_points_open[1] - self._robot_local_points_open[2]
+        tip_norm = float(np.linalg.norm(tip_delta))
+        self._robot_tip_axis_local = (
+            tip_delta / tip_norm if tip_norm > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        )
+        self._robot_tip_closed_half_gap = 0.015
+        self._robot_point_mode = "site"
         self._rng = np.random.default_rng(seed)
         self._step = 0
         self._prev_gripper_state = -1.0
@@ -521,6 +537,30 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
             )
             self._warned_missing_eef_quat = True
         return np.eye(3, dtype=np.float32)
+
+    def _build_default_robot_local_points(self):
+        T_g_b = np.asarray(self._robot_Tshift, dtype=np.float32)
+        points = [T_g_b[:3, 3].astype(np.float32)]
+        for Tp in self._robot_extrapoints:
+            pt = (T_g_b @ np.asarray(Tp, dtype=np.float32))[:3, 3]
+            points.append(pt.astype(np.float32))
+        return np.asarray(points, dtype=np.float32)
+
+    def _get_robot_points_from_pose(self, eef_pos, eef_rot, gripper_cmd):
+        local_points = np.asarray(self._robot_local_points_open, dtype=np.float32).copy()
+        if float(gripper_cmd) > 0.0 and local_points.shape[0] >= 3:
+            local_points[1] = (
+                self._robot_tip_mid_local
+                + self._robot_tip_axis_local * float(self._robot_tip_closed_half_gap)
+            )
+            local_points[2] = (
+                self._robot_tip_mid_local
+                - self._robot_tip_axis_local * float(self._robot_tip_closed_half_gap)
+            )
+        rot = np.asarray(eef_rot, dtype=np.float32).reshape(3, 3)
+        pos = np.asarray(eef_pos, dtype=np.float32).reshape(3)
+        all_points = pos[None, :] + (local_points @ rot.T)
+        return all_points[np.asarray(self._robot_point_indices, dtype=np.int32)]
 
     def _build_features(self, raw_obs):
         features = np.zeros((self._max_state_dim,), dtype=np.float32)
@@ -824,15 +864,42 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         quat = _quat_wxyz_to_xyzw(quat_wxyz)
         return pos, quat
 
-    def _get_robot_points_3d(self):
+    def _get_robot_points_3d(self, raw_obs=None):
         if not self._use_robot_points:
             return np.zeros((0, 3), dtype=np.float32)
-        if self._robot_site_ids is None:
-            self._resolve_robot_site_ids()
-        points = np.asarray(
-            self._env.sim.data.site_xpos[self._robot_site_ids], dtype=np.float32
-        )
-        points = points.reshape(-1, 3)
+
+        if self._robot_point_mode == "cal_offset":
+            if raw_obs is None:
+                raw_obs = self._current_raw_obs
+            if raw_obs is None:
+                raise RuntimeError(
+                    "raw_obs is required for robot cal_offset reconstruction, "
+                    "but current observation is not available."
+                )
+            eef_pos = self._extract_eef_pos(raw_obs)
+            eef_rot = self._extract_eef_rotmat(raw_obs)
+            gripper_cmd = self._extract_gripper_command_from_qpos(raw_obs)
+            points = self._get_robot_points_from_pose(eef_pos, eef_rot, gripper_cmd)
+        else:
+            if self._robot_site_ids is None:
+                self._resolve_robot_site_ids()
+            points = np.asarray(
+                self._env.sim.data.site_xpos[self._robot_site_ids], dtype=np.float32
+            ).reshape(-1, 3)
+            if points.shape[0] == 0:
+                # Runtime compat patch in env_bridge can force site fallback mode.
+                self._robot_point_mode = "cal_offset"
+                if raw_obs is None:
+                    raw_obs = self._current_raw_obs
+                if raw_obs is None:
+                    raise RuntimeError(
+                        "robot kp sites missing and raw_obs unavailable for fallback reconstruction."
+                    )
+                eef_pos = self._extract_eef_pos(raw_obs)
+                eef_rot = self._extract_eef_rotmat(raw_obs)
+                gripper_cmd = self._extract_gripper_command_from_qpos(raw_obs)
+                points = self._get_robot_points_from_pose(eef_pos, eef_rot, gripper_cmd)
+
         if points.shape[0] != self._num_robot_points:
             raise ValueError(
                 "Robot point count mismatch: "
@@ -892,7 +959,7 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         self._ensure_geometry_metadata(raw_obs)
 
         observation = {}
-        robot_tracks = self._get_robot_points_3d()
+        robot_tracks = self._get_robot_points_3d(raw_obs)
         object_tracks = self._get_object_points_3d(raw_obs)
         tracks = np.concatenate([robot_tracks, object_tracks], axis=0).astype(np.float32)
 

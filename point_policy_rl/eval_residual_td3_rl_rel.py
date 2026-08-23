@@ -46,7 +46,18 @@ from point_policy_rl.utils_rl import coerce_device, set_seed
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate residual TD3 checkpoint in _rl namespace")
-    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default="",
+        help="RL checkpoint path (.pt). Optional when --bc-weight is provided.",
+    )
+    parser.add_argument(
+        "--bc-weight",
+        type=str,
+        default="",
+        help="Direct BC checkpoint path for base-only eval (no RL checkpoint needed).",
+    )
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--device", type=str, default="cuda")
@@ -98,6 +109,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-fps", type=int, default=20)
     parser.add_argument("--video-render-size", type=int, default=256)
     parser.add_argument("--video-tag", type=str, default="")
+    parser.add_argument(
+        "--base-only",
+        action="store_true",
+        help="Ignore residual policy and execute base policy action only.",
+    )
     return parser.parse_args()
 
 
@@ -186,12 +202,18 @@ def _capture_frame(env, render_size: int) -> np.ndarray:
     return _normalize_frame(frame, render_size=render_size)
 
 
-def _resolve_video_dir(ckpt_path: Path, cli_video_dir: str | None) -> Path:
+def _resolve_video_dir(
+    ckpt_path: Path | None,
+    repo_root: Path,
+    cli_video_dir: str | None,
+) -> Path:
     if cli_video_dir is not None and str(cli_video_dir).strip() != "":
         out_dir = Path(cli_video_dir).expanduser().resolve()
-    else:
+    elif ckpt_path is not None:
         run_dir = ckpt_path.parent.parent if ckpt_path.parent.name == "snapshot" else ckpt_path.parent
         out_dir = (run_dir / "eval_videos_rl").resolve()
+    else:
+        out_dir = (repo_root / "point_policy" / "exp_local_rl_rel" / "base_only_eval_videos").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -236,28 +258,41 @@ def main() -> None:
 
     import torch
 
-    ckpt_path = Path(args.ckpt).resolve()
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
-
-    payload = torch.load(ckpt_path, map_location=device)
-    ckpt_format = "resfit_agent" if "agent" in payload else "td3_legacy"
-    if ckpt_format == "td3_legacy" and "td3" not in payload:
-        raise KeyError("Unsupported checkpoint format: expected 'td3' or 'agent' key")
-
-    # ResFiT checkpoints need the external resfit package root on sys.path.
-    if ckpt_format == "resfit_agent":
-        resfit_root = Path(args.resfit_root).expanduser().resolve()
-        if not (resfit_root / "resfit").exists():
-            raise FileNotFoundError(
-                f"Invalid resfit root (missing 'resfit/' package): {resfit_root}"
-            )
-        if str(resfit_root) not in sys.path:
-            sys.path.insert(0, str(resfit_root))
-
-    bc_weight = _resolve_bc_weight(payload)
-
     repo_root = Path(__file__).resolve().parents[1]
+    ckpt_path: Path | None = None
+    payload: dict = {"args": {}}
+    ckpt_format = "base_policy_only"
+    bc_weight = str(args.bc_weight).strip()
+
+    ckpt_arg = str(args.ckpt).strip()
+    if not ckpt_arg and not bc_weight:
+        raise ValueError("Provide either --ckpt or --bc-weight.")
+
+    if ckpt_arg:
+        ckpt_path = Path(ckpt_arg).resolve()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+        payload = torch.load(ckpt_path, map_location=device)
+        ckpt_format = "resfit_agent" if "agent" in payload else "td3_legacy"
+        if ckpt_format == "td3_legacy" and "td3" not in payload:
+            raise KeyError("Unsupported checkpoint format: expected 'td3' or 'agent' key")
+
+        # ResFiT checkpoints need the external resfit package root on sys.path.
+        if ckpt_format == "resfit_agent":
+            resfit_root = Path(args.resfit_root).expanduser().resolve()
+            if not (resfit_root / "resfit").exists():
+                raise FileNotFoundError(
+                    f"Invalid resfit root (missing 'resfit/' package): {resfit_root}"
+                )
+            if str(resfit_root) not in sys.path:
+                sys.path.insert(0, str(resfit_root))
+
+        bc_weight = _resolve_bc_weight(payload)
+    else:
+        print("[eval] direct BC mode: --bc-weight provided without --ckpt.")
+        if not args.base_only:
+            print("[eval] forcing --base-only in direct BC mode.")
+        args.base_only = True
 
     base = FrozenPointPolicyBaseRL(
         repo_root=repo_root,
@@ -359,7 +394,9 @@ def main() -> None:
     image_obs_key = ""
     image_hw: tuple[int, int] | None = None
 
-    if ckpt_format == "td3_legacy":
+    if args.base_only:
+        print("[eval] base_only mode enabled: residual policy outputs are ignored.")
+    elif ckpt_format == "td3_legacy":
         td3_payload = payload["td3"]
         td3_cfg_saved = td3_payload.get("cfg", {})
 
@@ -416,7 +453,14 @@ def main() -> None:
             )
         else:
             prop_dim = int(state0.shape[0] - 7)
-            obs_shape = tuple(int(x) for x in getattr(q_args, "obs_shape", (3, int(q_args.dummy_image_size), int(q_args.dummy_image_size))))
+            obs_shape = tuple(
+                int(x)
+                for x in getattr(
+                    q_args,
+                    "obs_shape",
+                    (3, int(q_args.dummy_image_size), int(q_args.dummy_image_size)),
+                )
+            )
             print(
                 f"[obs-mode] point_state_dummy_image obs_shape={obs_shape} prop_dim={prop_dim}"
             )
@@ -449,7 +493,11 @@ def main() -> None:
     video_dir: Path | None = None
     video_enabled = bool(args.save_video)
     if video_enabled:
-        video_dir = _resolve_video_dir(ckpt_path=ckpt_path, cli_video_dir=args.video_dir)
+        video_dir = _resolve_video_dir(
+            ckpt_path=ckpt_path,
+            repo_root=repo_root,
+            cli_video_dir=args.video_dir,
+        )
         print(
             f"[video] enabled dir={video_dir} fps={int(args.video_fps)} "
             f"render_size={int(args.video_render_size)}"
@@ -475,7 +523,9 @@ def main() -> None:
         while not done:
             base_action_dict = base.act(obs, step_in_ep, step_in_ep)
             base_action = np.asarray(env.point2action(base_action_dict), dtype=np.float32).reshape(7)
-            if td3 is not None:
+            if args.base_only:
+                env_action = clip_action(base_action, low=low, high=high)
+            elif td3 is not None:
                 state = observation_to_state(
                     obs=obs,
                     pixel_key=pixel_key,
@@ -567,7 +617,8 @@ def main() -> None:
         "episodes": args.episodes,
         "mean_return": float(np.mean(episode_returns)) if episode_returns else 0.0,
         "mean_success": float(np.mean(successes)) if successes else 0.0,
-        "checkpoint": str(ckpt_path),
+        "checkpoint": str(ckpt_path) if ckpt_path is not None else "",
+        "bc_weight": str(Path(bc_weight).expanduser().resolve()),
         "checkpoint_format": ckpt_format,
         "suite": suite_override,
         "task": task_override,
